@@ -22,3 +22,4 @@
     * or a better config, done via some service callable by the control plane
 * denylist for IPs or ranges
 * discuss round robin is intentionally imperfect, we don't need to be for this use case
+* on shutdown drain active connections before termination
