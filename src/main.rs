@@ -20,11 +20,10 @@ struct Args {
 
 // Push a forced shutdown over the channel. Eventually use this to drain connections properly.
 async fn shutdown_signal(shutdown_tx: watch::Sender<()>) {
-    let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
     let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
 
     select! {
-        _ = sigint.recv() => {
+        _ = tokio::signal::ctrl_c() => {
             println!("SIGINT received: shutting down");
         }
         _ = sigterm.recv() => {
@@ -40,8 +39,10 @@ async fn main() -> Result<(), Error> {
     let args = Args::parse();
     let raw_config = RawConfig::load_from_file(args.config)?;
     let proxy_config = ProxyConfig::try_from(raw_config)?;
+
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     tokio::spawn(shutdown_signal(shutdown_tx));
+
     proxy::proxy_server(Arc::new(proxy_config), shutdown_rx).await?;
 
     Ok(())
