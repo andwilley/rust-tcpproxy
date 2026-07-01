@@ -5,10 +5,7 @@ use tokio::sync::watch;
 
 use clap::Parser;
 use std::{path::PathBuf, sync::Arc};
-use tcpproxy::{
-    config::{ProxyConfig, RawConfig},
-    proxy,
-};
+use tcpproxy::{config::RawConfig, proxy, state::ProxyState};
 
 #[derive(Parser)]
 #[command(version, about = "A simple TCP Proxy", long_about = None)]
@@ -38,7 +35,7 @@ async fn shutdown_signal(shutdown_tx: watch::Sender<()>) {
 async fn main() -> Result<(), Error> {
     let args = Args::parse();
     let raw_config = RawConfig::load_from_file(args.config)?;
-    let proxy_config = ProxyConfig::try_from(raw_config)?;
+    let proxy_config = ProxyState::try_from(raw_config)?;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     tokio::spawn(shutdown_signal(shutdown_tx));
