@@ -14,10 +14,10 @@ use tokio::select;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
-pub async fn proxy_server(config: Arc<ProxyState>, shutdown_rx: watch::Receiver<()>) -> Result<()> {
+pub async fn proxy_server(state: Arc<ProxyState>, shutdown_rx: watch::Receiver<()>) -> Result<()> {
     let mut handles = JoinSet::new();
-    for port in config.ports() {
-        handles.spawn(listen(port, config.clone(), shutdown_rx.clone()));
+    for port in state.ports() {
+        handles.spawn(listen(port, state.clone(), shutdown_rx.clone()));
     }
     while let Some(res) = handles.join_next().await {
         match res {
@@ -44,9 +44,9 @@ async fn listen(
         select! {
             accept_result = listener.accept() => {
                 let (in_sock, _source_addr) = accept_result?;
-                let config = conf.clone();
+                let state = conf.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = do_connection(port, &config, in_sock).await {
+                    if let Err(e) = do_connection(port, &state, in_sock).await {
                         eprintln!("Connection to backends for port {port} failed: {e}")
                     }
                 });
@@ -60,21 +60,17 @@ async fn listen(
 
 async fn do_connection(
     port: u16,
-    config: &ProxyState,
+    state: &ProxyState,
     mut in_sock: TcpStream,
 ) -> std::io::Result<()> {
-    let mut out_sock = connect_backend(port, &config).await?;
+    let mut out_sock = connect_backend_rr(port, &state).await?;
     tokio::io::copy_bidirectional(&mut in_sock, &mut out_sock).await?;
     Ok(())
 }
 
-// If we fail to connect, we should update a shared set of bad backends with a timestamp and
-// schduled retry. It isn't critical that this is fully synchronized, its OK if a few listeners
-// attempt to connect, just that we reasonably quickly mark it for the penalty box.
-//
 // If possible we could replace with just a generic strategy and implemnt it for each balancer.
-async fn connect_backend(port: u16, config: &ProxyState) -> std::io::Result<TcpStream> {
-    let Some(targets) = config.get_pool(port) else {
+async fn connect_backend_rr(port: u16, state: &ProxyState) -> std::io::Result<TcpStream> {
+    let Some(targets) = state.get_pool(port) else {
         return Err(Error::new(
             ErrorKind::NotFound,
             format!("No targets for port {port}, Something terrible has occurred"),
@@ -88,7 +84,7 @@ async fn connect_backend(port: u16, config: &ProxyState) -> std::io::Result<TcpS
         ));
     }
 
-    let start_idx = match config.get_rr_counter(port) {
+    let start_idx = match state.get_rr_counter(port) {
         Some(counter) => counter.fetch_add(1, Relaxed) % targets.len(),
         None => {
             return Err(Error::new(
@@ -101,7 +97,7 @@ async fn connect_backend(port: u16, config: &ProxyState) -> std::io::Result<TcpS
     for i in 0..targets.len() {
         let target = &targets[(start_idx + i) % targets.len()];
         {
-            let target_status = config.get_target_status(target).unwrap().read().unwrap();
+            let target_status = state.get_target_status(target).unwrap().read().unwrap();
             match *target_status {
                 BackendStatus::Dead => continue,
                 BackendStatus::Alive(Some(time)) if time > Instant::now() => continue,
@@ -110,19 +106,15 @@ async fn connect_backend(port: u16, config: &ProxyState) -> std::io::Result<TcpS
         }
         let sock_addr = match resolve(target).await {
             Ok(t) => t,
-            // Deny list this target.
             Err(e) => {
-                // If we can't update the target status, it means the lock was contended, which
-                // means another task was trying to penalize or kill this target, which means our
-                // problem is solved.
-                let _ = config.update_target_status(target, BackendStatus::Dead);
+                let _ = state.update_target_status(target, BackendStatus::Dead);
                 return Err(e);
             }
         };
         match TcpStream::connect(sock_addr).await {
             Ok(stream) => return Ok(stream),
             Err(e) => {
-                let _ = config.update_target_status(
+                let _ = state.update_target_status(
                     target,
                     BackendStatus::Alive(Some(Instant::now() + Duration::from_mins(30))),
                 );

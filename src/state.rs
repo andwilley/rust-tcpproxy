@@ -50,6 +50,9 @@ impl ProxyState {
             .target_status
             .get(target)
             .ok_or(TargetStatusUpdateError::TargetNotFound)?;
+        // If we can't update the target status, it means the lock was contended, which
+        // means another task was trying to penalize or kill this target, which means our
+        // problem is solved. We don't need to block on aquiring this lock.
         match lock.try_write() {
             Ok(mut target_status) => {
                 *target_status = status;
