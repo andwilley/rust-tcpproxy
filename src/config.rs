@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
 
+use crate::errors::ProxyError;
+
 #[derive(Deserialize, Serialize)]
 pub struct RawConfig {
     #[serde(rename = "Apps")]
@@ -20,7 +22,7 @@ pub struct App {
 }
 
 impl RawConfig {
-    pub fn load_from_file(path: PathBuf) -> anyhow::Result<RawConfig> {
+    pub fn load_from_file(path: PathBuf) -> Result<RawConfig, ProxyError> {
         let content = fs::read_to_string(path)?;
         let config: RawConfig = serde_json::from_str(&content)?;
 
