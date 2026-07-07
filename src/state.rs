@@ -7,6 +7,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Instant;
 
+// TODO: the rr_counter should actually live on a struct that impls the loadbalancer trait
+// And the proxystate just holds a load balancer, or maybe it doesn't and the server needs a load
+// balancer to construct itself.
 pub struct ProxyState {
     target_pools: Vec<Vec<String>>,
     port_to_pool: HashMap<u16, usize>,
