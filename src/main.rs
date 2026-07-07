@@ -1,4 +1,4 @@
-use anyhow::{Error, Result};
+use tcpproxy::errors::ProxyError;
 use tokio::select;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
@@ -32,7 +32,7 @@ async fn shutdown_signal(shutdown_tx: watch::Sender<()>) {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Error> {
+async fn main() -> Result<(), ProxyError> {
     let args = Args::parse();
     let raw_config = RawConfig::load_from_file(args.config)?;
     let proxy_config = ProxyState::try_from(raw_config)?;

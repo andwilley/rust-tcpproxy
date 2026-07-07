@@ -1,8 +1,6 @@
+use crate::errors::ProxyError;
 use crate::state::BackendStatus;
 use crate::state::ProxyState;
-use anyhow::Context;
-use anyhow::Result;
-use std::io::{Error, ErrorKind};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
@@ -14,7 +12,10 @@ use tokio::select;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
-pub async fn proxy_server(state: Arc<ProxyState>, shutdown_rx: watch::Receiver<()>) -> Result<()> {
+pub async fn proxy_server(
+    state: Arc<ProxyState>,
+    shutdown_rx: watch::Receiver<()>,
+) -> Result<(), ProxyError> {
     let mut handles = JoinSet::new();
     for port in state.ports() {
         handles.spawn(listen(port, state.clone(), shutdown_rx.clone()));
@@ -23,10 +24,14 @@ pub async fn proxy_server(state: Arc<ProxyState>, shutdown_rx: watch::Receiver<(
         match res {
             Ok(Ok(())) => println!("A listener exited successfully"),
             Ok(Err(listen_error)) => {
-                return Err(listen_error).context("Listener exited with error");
+                return Err(listen_error.into());
             }
             Err(join_error) => {
-                return Err(join_error.into());
+                if join_error.is_cancelled() {
+                    return Err(ProxyError::TaskCancellation {
+                        message: join_error.to_string(),
+                    });
+                }
             }
         }
     }
@@ -62,44 +67,43 @@ async fn do_connection(
     port: u16,
     state: &ProxyState,
     mut in_sock: TcpStream,
-) -> std::io::Result<()> {
+) -> Result<(), ProxyError> {
     let mut out_sock = connect_backend_rr(port, &state).await?;
     tokio::io::copy_bidirectional(&mut in_sock, &mut out_sock).await?;
     Ok(())
 }
 
 // If possible we could replace with just a generic strategy and implemnt it for each balancer.
-async fn connect_backend_rr(port: u16, state: &ProxyState) -> std::io::Result<TcpStream> {
+async fn connect_backend_rr(port: u16, state: &ProxyState) -> Result<TcpStream, ProxyError> {
     let Some(targets) = state.get_pool(port) else {
-        return Err(Error::new(
-            ErrorKind::NotFound,
-            format!("No targets for port {port}, Something terrible has occurred"),
-        ));
+        return Err(ProxyError::TargetResolutionError {
+            port: port,
+            message: "No targets configured".to_string(),
+        });
     };
 
     if targets.is_empty() {
-        return Err(Error::new(
-            ErrorKind::NotFound,
-            format!("empty targets list for port {port}"),
-        ));
+        return Err(ProxyError::TargetResolutionError {
+            port: port,
+            message: format!("empty targets list for port {port}"),
+        });
     }
 
     let start_idx = match state.get_rr_counter(port) {
         Some(counter) => counter.fetch_add(1, Relaxed) % targets.len(),
         None => {
-            return Err(Error::new(
-                ErrorKind::NotFound,
-                format!("failed to load round robin counter for port {port}"),
-            ));
+            return Err(ProxyError::ProxyStateError {
+                message: format!("failed to load round robin counter for port {port}"),
+            });
         }
     };
 
     for i in 0..targets.len() {
         let target = &targets[(start_idx + i) % targets.len()];
         {
-            let target_status = state.get_target_status(target).unwrap().read().unwrap();
-            match *target_status {
-                BackendStatus::Dead => continue,
+            let target_status = state.get_target_status(target)?;
+            match **target_status {
+                BackendStatus::Drain => continue,
                 BackendStatus::Alive(Some(time)) if time > Instant::now() => continue,
                 _ => {}
             }
@@ -107,7 +111,7 @@ async fn connect_backend_rr(port: u16, state: &ProxyState) -> std::io::Result<Tc
         let sock_addr = match resolve(target).await {
             Ok(t) => t,
             Err(e) => {
-                let _ = state.update_target_status(target, BackendStatus::Dead);
+                let _ = state.update_target_status(target, BackendStatus::Drain);
                 return Err(e);
             }
         };
@@ -122,19 +126,17 @@ async fn connect_backend_rr(port: u16, state: &ProxyState) -> std::io::Result<Tc
             }
         };
     }
-
-    Err(Error::new(
-        ErrorKind::NotConnected,
-        format!("Unable to connect to any backend for port {port}"),
-    ))
+    Err(ProxyError::ConnectionError {
+        port: port,
+        message: format!("Unable to connect to any backend for port {port}"),
+    })
 }
 
-async fn resolve(target: &str) -> std::io::Result<SocketAddr> {
+async fn resolve(target: &str) -> Result<SocketAddr, ProxyError> {
     return match tokio::net::lookup_host(target).await?.next() {
         Some(a) => Ok(a),
-        None => Err(Error::new(
-            ErrorKind::AddrNotAvailable,
-            format!("No IP address found for {target}"),
-        )),
+        None => Err(ProxyError::ProxyStateError {
+            message: format!("No IP address found for {target}"),
+        }),
     };
 }

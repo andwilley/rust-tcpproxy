@@ -1,7 +1,9 @@
 use crate::config::RawConfig;
+use crate::errors::ProxyError;
+use arc_swap::{ArcSwap, Guard};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::sync::RwLock;
+use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Instant;
 
@@ -9,18 +11,13 @@ pub struct ProxyState {
     target_pools: Vec<Vec<String>>,
     port_to_pool: HashMap<u16, usize>,
     port_to_rr_counter: HashMap<u16, AtomicUsize>,
-    target_status: HashMap<String, RwLock<BackendStatus>>,
+    target_status: HashMap<String, ArcSwap<BackendStatus>>,
 }
 
 pub enum BackendStatus {
-    /// Don't call this backend until the specified time.
+    /// Don't call this backend until the specified Some(time).
     Alive(Option<Instant>),
-    Dead,
-}
-
-pub enum TargetStatusUpdateError {
-    TargetNotFound,
-    Contended,
+    Drain,
 }
 
 impl ProxyState {
@@ -37,52 +34,55 @@ impl ProxyState {
         self.port_to_pool.keys().copied()
     }
 
-    pub fn get_target_status(&self, target: &str) -> Option<&RwLock<BackendStatus>> {
-        self.target_status.get(target)
+    pub fn get_target_status(&self, target: &str) -> Result<Guard<Arc<BackendStatus>>, ProxyError> {
+        self.target_status
+            .get(target)
+            .map(|status_val| status_val.load())
+            .ok_or(ProxyError::BackendNotFound {
+                name: target.into(),
+            })
     }
 
     pub fn update_target_status(
         &self,
         target: &str,
         status: BackendStatus,
-    ) -> Result<(), TargetStatusUpdateError> {
-        let lock = self
-            .target_status
-            .get(target)
-            .ok_or(TargetStatusUpdateError::TargetNotFound)?;
-        // If we can't update the target status, it means the lock was contended, which
-        // means another task was trying to penalize or kill this target, which means our
-        // problem is solved. We don't need to block on aquiring this lock.
-        match lock.try_write() {
-            Ok(mut target_status) => {
-                *target_status = status;
-                Ok(())
-            }
-            Err(std::sync::TryLockError::WouldBlock) => Err(TargetStatusUpdateError::Contended),
-            Err(std::sync::TryLockError::Poisoned(_)) => panic!("Lock poisoned for host {target}"),
-        }
+    ) -> Result<(), ProxyError> {
+        let backend_swap: &ArcSwap<BackendStatus> =
+            self.target_status
+                .get(target)
+                .ok_or(ProxyError::BackendNotFound {
+                    name: target.into(),
+                })?;
+        backend_swap.store(Arc::new(status));
+        Ok(())
     }
 }
 
 impl TryFrom<RawConfig> for ProxyState {
-    type Error = anyhow::Error;
+    type Error = ProxyError;
 
     fn try_from(raw: RawConfig) -> Result<ProxyState, Self::Error> {
         let mut target_pools = Vec::new();
         let mut port_to_pool = HashMap::<u16, usize>::new();
         let mut port_to_rr_counter = HashMap::<u16, AtomicUsize>::new();
-        let mut target_status = HashMap::<String, RwLock<BackendStatus>>::new();
+        let mut target_status = HashMap::<String, ArcSwap<BackendStatus>>::new();
 
         for app in raw.apps {
             for target in &app.targets {
-                target_status.insert(target.clone(), RwLock::new(BackendStatus::Alive(None)));
+                target_status.insert(
+                    target.clone(),
+                    ArcSwap::from_pointee(BackendStatus::Alive(None)),
+                );
             }
             target_pools.push(app.targets);
 
             for port in app.ports {
                 match port_to_pool.entry(port) {
                     Entry::Occupied(_) => {
-                        return Err(anyhow::anyhow!("Duplicate port definition {}", port));
+                        return Err(ProxyError::ConfigIngestError {
+                            message: format!("Duplicate port definition {}", port),
+                        });
                     }
                     Entry::Vacant(entry) => {
                         entry.insert(target_pools.len());
