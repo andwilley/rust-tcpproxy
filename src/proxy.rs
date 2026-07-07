@@ -11,12 +11,14 @@ use tokio::net::TcpStream;
 use tokio::select;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
+use tokio::time::timeout;
 
 pub async fn proxy_server(
     state: Arc<ProxyState>,
     shutdown_rx: watch::Receiver<()>,
 ) -> Result<(), ProxyError> {
     let mut handles = JoinSet::new();
+    // TODO: track these task handles so we can clean them up if needed
     for port in state.ports() {
         handles.spawn(listen(port, state.clone(), shutdown_rx.clone()));
     }
@@ -38,6 +40,7 @@ pub async fn proxy_server(
     Ok(())
 }
 
+// TODO: Drain connections before exiting
 async fn listen(
     port: u16,
     conf: Arc<ProxyState>,
@@ -48,8 +51,10 @@ async fn listen(
     loop {
         select! {
             accept_result = listener.accept() => {
+                // TODO: handle this result explicitly
                 let (in_sock, _source_addr) = accept_result?;
                 let state = conf.clone();
+                // TODO: Track these task handles
                 tokio::spawn(async move {
                     if let Err(e) = do_connection(port, &state, in_sock).await {
                         eprintln!("Connection to backends for port {port} failed: {e}")
@@ -77,14 +82,14 @@ async fn do_connection(
 async fn connect_backend_rr(port: u16, state: &ProxyState) -> Result<TcpStream, ProxyError> {
     let Some(targets) = state.get_pool(port) else {
         return Err(ProxyError::TargetResolutionError {
-            port: port,
+            port,
             message: "No targets configured".to_string(),
         });
     };
 
     if targets.is_empty() {
         return Err(ProxyError::TargetResolutionError {
-            port: port,
+            port,
             message: format!("empty targets list for port {port}"),
         });
     }
@@ -112,26 +117,40 @@ async fn connect_backend_rr(port: u16, state: &ProxyState) -> Result<TcpStream, 
             Ok(t) => t,
             Err(e) => {
                 let _ = state.update_target_status(target, BackendStatus::Drain);
-                return Err(e);
+                eprintln!("DNS resolution failed for {target}: {e}");
+                continue;
             }
         };
-        match TcpStream::connect(sock_addr).await {
-            Ok(stream) => return Ok(stream),
-            Err(e) => {
+        // TODO: This deadline and the delays below should be in config
+        let connect_timeout = Duration::from_secs(5);
+        match timeout(connect_timeout, TcpStream::connect(sock_addr)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => {
                 let _ = state.update_target_status(
                     target,
                     BackendStatus::Alive(Some(Instant::now() + Duration::from_mins(30))),
                 );
                 eprintln!("failed to connect to backend target {target}: {e}");
             }
+            Err(_) => {
+                let _ = state.update_target_status(
+                    target,
+                    BackendStatus::Alive(Some(Instant::now() + Duration::from_mins(30))),
+                );
+                eprintln!(
+                    "connection to target {target} timed out after {:?}",
+                    connect_timeout
+                );
+            }
         };
     }
     Err(ProxyError::ConnectionError {
-        port: port,
+        port,
         message: format!("Unable to connect to any backend for port {port}"),
     })
 }
 
+// TODO: consider caching resolved hosts
 async fn resolve(target: &str) -> Result<SocketAddr, ProxyError> {
     return match tokio::net::lookup_host(target).await?.next() {
         Some(a) => Ok(a),
