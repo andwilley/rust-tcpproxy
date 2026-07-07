@@ -1,48 +1,33 @@
-use std::{fmt, io::ErrorKind};
+use std::io::ErrorKind;
+use thiserror::Error;
 
 use serde_json::error::Category;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum ProxyError {
+    #[error("No target found for backend named {name}")]
     BackendNotFound { name: String },
-    ConfigIngestError { message: String },
-    TargetResolutionError { port: u16, message: String },
-    ConnectionError { port: u16, message: String },
-    ProxyStateError { message: String },
-    IoError { kind: ErrorKind, message: String },
-    JsonError { category: Category, message: String },
-    TaskCancellation { message: String },
-}
 
-impl fmt::Display for ProxyError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::BackendNotFound { name } => {
-                write!(f, "No target found for backend named {}", name)
-            }
-            Self::ConfigIngestError { message } => {
-                write!(f, "Error ingesting proxy config: {}", message)
-            }
-            Self::TargetResolutionError { port, message } => {
-                write!(f, "Error resolving targets for {}: {}", port, message)
-            }
-            Self::ConnectionError { port, message } => {
-                write!(f, "Connection error for port {}: {}", port, message)
-            }
-            Self::ProxyStateError { message } => {
-                write!(f, "Error in Proxy state: {}", message)
-            }
-            Self::IoError { kind, message } => {
-                write!(f, "Network I/O error {}: {}", kind, message)
-            }
-            Self::JsonError { category, message } => {
-                write!(f, "Json parse error {:?}: {}", category, message)
-            }
-            Self::TaskCancellation { message } => {
-                write!(f, "A task was cancelled: {}", message)
-            }
-        }
-    }
+    #[error("Error ingesting proxy config: {message}")]
+    ConfigIngestError { message: String },
+
+    #[error("Error resolving targets for {port}: {message}")]
+    TargetResolutionError { port: u16, message: String },
+
+    #[error("Connection error for port {port}: {message}")]
+    ConnectionError { port: u16, message: String },
+
+    #[error("Error in Proxy state: {message}")]
+    ProxyStateError { message: String },
+
+    #[error("Network I/O error {kind}: {message}")]
+    IoError { kind: ErrorKind, message: String },
+
+    #[error("Json parse error {category:?}: {message}")]
+    JsonError { category: Category, message: String },
+
+    #[error("A task was cancelled: {message}")]
+    TaskCancellation { message: String },
 }
 
 impl From<std::io::Error> for ProxyError {

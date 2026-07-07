@@ -16,6 +16,7 @@ pub struct ProxyState {
 
 pub enum BackendStatus {
     /// Don't call this backend until the specified Some(time).
+    // TODO: name this field
     Alive(Option<Instant>),
     Drain,
 }
@@ -85,7 +86,7 @@ impl TryFrom<RawConfig> for ProxyState {
                         });
                     }
                     Entry::Vacant(entry) => {
-                        entry.insert(target_pools.len());
+                        entry.insert(target_pools.len() - 1);
                         port_to_rr_counter.insert(port, AtomicUsize::new(0));
                     }
                 }
