@@ -1,10 +1,11 @@
 use tcpproxy::errors::ProxyError;
+use tcpproxy::traits::{TokioConnector, TokioResolver, TokioStreamListenerFactory};
 use tokio::select;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 
 use clap::Parser;
-use std::{path::PathBuf, sync::Arc};
+use std::path::PathBuf;
 use tcpproxy::{config::RawConfig, proxy, state::ProxyState};
 
 #[derive(Parser)]
@@ -35,12 +36,20 @@ async fn shutdown_signal(shutdown_tx: watch::Sender<()>) {
 async fn main() -> Result<(), ProxyError> {
     let args = Args::parse();
     let raw_config = RawConfig::load_from_file(args.config)?;
-    let proxy_config = ProxyState::try_from(raw_config)?;
+    let state = ProxyState::try_from(raw_config)?;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     tokio::spawn(shutdown_signal(shutdown_tx));
 
-    proxy::proxy_server(Arc::new(proxy_config), shutdown_rx).await?;
+    proxy::ProxyServer::new(
+        TokioStreamListenerFactory,
+        TokioConnector,
+        TokioResolver,
+        state,
+        shutdown_rx,
+    )
+    .run()
+    .await?;
 
     Ok(())
 }

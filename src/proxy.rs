@@ -1,85 +1,160 @@
 use crate::errors::ProxyError;
 use crate::state::BackendStatus;
 use crate::state::ProxyState;
+use crate::traits::AsyncStream;
+use crate::traits::Resolver;
+use crate::traits::StreamConnector;
+use crate::traits::StreamListener;
+use crate::traits::StreamListenerFactory;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 use std::time::Instant;
-use tokio::net::TcpListener;
-use tokio::net::TcpStream;
 use tokio::select;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
-pub async fn proxy_server(
+pub struct ProxyServer<L, C, R> {
+    listener_factory: L,
+    connector: C,
+    resolver: R,
     state: Arc<ProxyState>,
     shutdown_rx: watch::Receiver<()>,
-) -> Result<(), ProxyError> {
-    let mut handles = JoinSet::new();
-    // TODO: track these task handles so we can clean them up if needed
-    for port in state.ports() {
-        handles.spawn(listen(port, state.clone(), shutdown_rx.clone()));
+}
+
+impl<L, C, R> ProxyServer<L, C, R>
+where
+    L: StreamListenerFactory + 'static,
+    C: StreamConnector + 'static,
+    R: Resolver + 'static,
+{
+    pub fn new(
+        listener_factory: L,
+        connector: C,
+        resolver: R,
+        state: ProxyState,
+        shutdown_rx: watch::Receiver<()>,
+    ) -> Self {
+        Self {
+            listener_factory,
+            connector,
+            resolver,
+            state: Arc::new(state),
+            shutdown_rx,
+        }
     }
-    while let Some(res) = handles.join_next().await {
-        match res {
-            Ok(Ok(())) => println!("A listener exited successfully"),
-            Ok(Err(listen_error)) => {
-                return Err(listen_error.into());
-            }
-            Err(join_error) => {
-                if join_error.is_cancelled() {
-                    return Err(ProxyError::TaskCancellation {
-                        message: join_error.to_string(),
-                    });
+
+    pub async fn run(self) -> Result<(), ProxyError> {
+        let mut handles = JoinSet::new();
+        for port in self.state.ports() {
+            handles.spawn(listen(
+                port,
+                self.listener_factory.clone(),
+                self.connector.clone(),
+                self.resolver.clone(),
+                self.state.clone(),
+                self.shutdown_rx.clone(),
+            ));
+        }
+        while let Some(res) = handles.join_next().await {
+            match res {
+                Ok(Ok(())) => println!("A listener exited successfully"),
+                Ok(Err(listen_error)) => {
+                    return Err(listen_error);
+                }
+                Err(join_error) => {
+                    if join_error.is_cancelled() {
+                        return Err(ProxyError::TaskCancellation {
+                            message: join_error.to_string(),
+                        });
+                    }
                 }
             }
         }
+        Ok(())
     }
-    Ok(())
 }
 
-// TODO: Drain connections before exiting
-async fn listen(
+async fn listen<L, C, R>(
     port: u16,
-    conf: Arc<ProxyState>,
+    listener_factory: L,
+    connector: C,
+    resolver: R,
+    state: Arc<ProxyState>,
     mut shutdown_rx: watch::Receiver<()>,
-) -> std::io::Result<()> {
-    let listener = TcpListener::bind(format!("[::]:{port}")).await?;
+) -> Result<(), ProxyError>
+where
+    L: StreamListenerFactory + 'static,
+    C: StreamConnector + 'static,
+    R: Resolver + 'static,
+{
+    let listener = listener_factory.bind(format!("[::]:{port}")).await?;
+    let mut connections = JoinSet::new();
 
     loop {
         select! {
             accept_result = listener.accept() => {
-                // TODO: handle this result explicitly
+                // TODO: handle this result explicitly and backoff for transient errors
                 let (in_sock, _source_addr) = accept_result?;
-                let state = conf.clone();
-                // TODO: Track these task handles
-                tokio::spawn(async move {
-                    if let Err(e) = do_connection(port, &state, in_sock).await {
+                let new_state = state.clone();
+                let new_resolver = resolver.clone();
+                let new_connector = connector.clone();
+                connections.spawn(async move {
+                    if let Err(e) = do_connection(port, &new_state, in_sock, new_resolver, new_connector).await {
                         eprintln!("Connection to backends for port {port} failed: {e}")
                     }
                 });
             }
             _ = shutdown_rx.changed() => {
-                break Ok(());
+                break;
             }
         }
     }
+
+    println!("Shutting down, attempting to drain open connections.");
+    select! {
+        _ = async {
+            while connections.join_next().await.is_some() {}
+        } => {}
+        _ = sleep(Duration::from_secs(10)) => {
+            println!("Shutdown deadline reached, aborting.")
+        }
+    }
+    Ok(())
 }
 
-async fn do_connection(
+async fn do_connection<S, R, C>(
     port: u16,
     state: &ProxyState,
-    mut in_sock: TcpStream,
-) -> Result<(), ProxyError> {
-    let mut out_sock = connect_backend_rr(port, &state).await?;
+    mut in_sock: S,
+    resolver: R,
+    connector: C,
+) -> Result<(), ProxyError>
+where
+    S: AsyncStream,
+    R: Resolver,
+    C: StreamConnector,
+{
+    let mut out_sock = connect_backend_rr(port, state, resolver, connector).await?;
     tokio::io::copy_bidirectional(&mut in_sock, &mut out_sock).await?;
     Ok(())
 }
 
-// If possible we could replace with just a generic strategy and implemnt it for each balancer.
-async fn connect_backend_rr(port: u16, state: &ProxyState) -> Result<TcpStream, ProxyError> {
+// TODO: This should be implemented by a LoadBalancer trait. It needs access to a round robin
+// counter state map, this could live on the struct we impl it for as it does not apply to any other
+// implemenation of LoadBalancer.
+async fn connect_backend_rr<R, C>(
+    port: u16,
+    state: &ProxyState,
+    resolver: R,
+    connector: C,
+) -> Result<C::Stream, ProxyError>
+where
+    R: Resolver,
+    C: StreamConnector,
+{
     let Some(targets) = state.get_pool(port) else {
         return Err(ProxyError::TargetResolutionError {
             port,
@@ -113,7 +188,7 @@ async fn connect_backend_rr(port: u16, state: &ProxyState) -> Result<TcpStream, 
                 _ => {}
             }
         }
-        let sock_addr = match resolve(target).await {
+        let sock_addr = match resolve(target, &resolver).await {
             Ok(t) => t,
             Err(e) => {
                 let _ = state.update_target_status(target, BackendStatus::Drain);
@@ -123,7 +198,7 @@ async fn connect_backend_rr(port: u16, state: &ProxyState) -> Result<TcpStream, 
         };
         // TODO: This deadline and the delays below should be in config
         let connect_timeout = Duration::from_secs(5);
-        match timeout(connect_timeout, TcpStream::connect(sock_addr)).await {
+        match timeout(connect_timeout, connector.connect(sock_addr)).await {
             Ok(Ok(stream)) => return Ok(stream),
             Ok(Err(e)) => {
                 let _ = state.update_target_status(
@@ -151,8 +226,11 @@ async fn connect_backend_rr(port: u16, state: &ProxyState) -> Result<TcpStream, 
 }
 
 // TODO: consider caching resolved hosts
-async fn resolve(target: &str) -> Result<SocketAddr, ProxyError> {
-    return match tokio::net::lookup_host(target).await?.next() {
+async fn resolve<R>(target: &str, resolver: &R) -> Result<SocketAddr, ProxyError>
+where
+    R: Resolver,
+{
+    return match resolver.lookup_host(target).await?.next() {
         Some(a) => Ok(a),
         None => Err(ProxyError::ProxyStateError {
             message: format!("No IP address found for {target}"),
