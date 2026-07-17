@@ -1,12 +1,16 @@
 use tcpproxy::errors::ProxyError;
-use tcpproxy::traits::{TokioConnector, TokioResolver, TokioStreamListenerFactory};
+use tcpproxy::state::TargetState;
+use tcpproxy::traits::{
+    RoundRobinBalancer, TokioConnector, TokioResolver, TokioStreamListenerFactory,
+};
 use tokio::select;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 
 use clap::Parser;
 use std::path::PathBuf;
-use tcpproxy::{config::RawConfig, proxy, state::ProxyState};
+use std::sync::Arc;
+use tcpproxy::{config::RawConfig, proxy, state::ProxyConfig};
 
 #[derive(Parser)]
 #[command(version, about = "A simple TCP Proxy", long_about = None)]
@@ -36,16 +40,16 @@ async fn shutdown_signal(shutdown_tx: watch::Sender<()>) {
 async fn main() -> Result<(), ProxyError> {
     let args = Args::parse();
     let raw_config = RawConfig::load_from_file(args.config)?;
-    let state = ProxyState::try_from(raw_config)?;
+    let config = Arc::new(ProxyConfig::try_from(&raw_config)?);
+    let targets = TargetState::try_from(&raw_config)?;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     tokio::spawn(shutdown_signal(shutdown_tx));
 
     proxy::ProxyServer::new(
         TokioStreamListenerFactory,
-        TokioConnector,
-        TokioResolver,
-        state,
+        RoundRobinBalancer::new(config.clone(), targets, TokioResolver, TokioConnector),
+        config.clone(),
         shutdown_rx,
     )
     .run()
