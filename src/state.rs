@@ -4,16 +4,17 @@ use arc_swap::{ArcSwap, Guard};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
 use std::time::Instant;
 
 // TODO: the rr_counter should actually live on a struct that impls the loadbalancer trait
 // And the proxystate just holds a load balancer, or maybe it doesn't and the server needs a load
 // balancer to construct itself.
-pub struct ProxyState {
+pub struct ProxyConfig {
     target_pools: Vec<Vec<String>>,
     port_to_pool: HashMap<u16, usize>,
-    port_to_rr_counter: HashMap<u16, AtomicUsize>,
+}
+
+pub struct TargetState {
     target_status: HashMap<String, ArcSwap<BackendStatus>>,
 }
 
@@ -24,20 +25,7 @@ pub enum BackendStatus {
     Drain,
 }
 
-impl ProxyState {
-    pub fn get_pool(&self, port: u16) -> Option<&[String]> {
-        let idx = *self.port_to_pool.get(&port)?;
-        self.target_pools.get(idx).map(|target| target.as_slice())
-    }
-
-    pub fn get_rr_counter(&self, port: u16) -> Option<&AtomicUsize> {
-        self.port_to_rr_counter.get(&port)
-    }
-
-    pub fn ports(&self) -> impl Iterator<Item = u16> {
-        self.port_to_pool.keys().copied()
-    }
-
+impl TargetState {
     pub fn get_target_status(&self, target: &str) -> Result<Guard<Arc<BackendStatus>>, ProxyError> {
         self.target_status
             .get(target)
@@ -63,26 +51,47 @@ impl ProxyState {
     }
 }
 
-impl TryFrom<RawConfig> for ProxyState {
+impl ProxyConfig {
+    pub fn get_pool(&self, port: u16) -> Option<&[String]> {
+        let idx = *self.port_to_pool.get(&port)?;
+        self.target_pools.get(idx).map(|target| target.as_slice())
+    }
+
+    pub fn ports(&self) -> impl Iterator<Item = u16> {
+        self.port_to_pool.keys().copied()
+    }
+}
+
+impl TryFrom<&RawConfig> for TargetState {
     type Error = ProxyError;
 
-    fn try_from(raw: RawConfig) -> Result<ProxyState, Self::Error> {
-        let mut target_pools = Vec::new();
-        let mut port_to_pool = HashMap::<u16, usize>::new();
-        let mut port_to_rr_counter = HashMap::<u16, AtomicUsize>::new();
+    fn try_from(raw: &RawConfig) -> Result<TargetState, Self::Error> {
         let mut target_status = HashMap::<String, ArcSwap<BackendStatus>>::new();
 
-        for app in raw.apps {
+        for app in &raw.apps {
             for target in &app.targets {
                 target_status.insert(
                     target.clone(),
                     ArcSwap::from_pointee(BackendStatus::Alive(None)),
                 );
             }
-            target_pools.push(app.targets);
+        }
+        Ok(TargetState { target_status })
+    }
+}
 
-            for port in app.ports {
-                match port_to_pool.entry(port) {
+impl TryFrom<&RawConfig> for ProxyConfig {
+    type Error = ProxyError;
+
+    fn try_from(raw: &RawConfig) -> Result<ProxyConfig, Self::Error> {
+        let mut target_pools = Vec::new();
+        let mut port_to_pool = HashMap::<u16, usize>::new();
+
+        for app in &raw.apps {
+            target_pools.push(app.targets.clone());
+
+            for port in &app.ports {
+                match port_to_pool.entry(*port) {
                     Entry::Occupied(_) => {
                         return Err(ProxyError::ConfigIngestError {
                             message: format!("Duplicate port definition {}", port),
@@ -90,16 +99,13 @@ impl TryFrom<RawConfig> for ProxyState {
                     }
                     Entry::Vacant(entry) => {
                         entry.insert(target_pools.len() - 1);
-                        port_to_rr_counter.insert(port, AtomicUsize::new(0));
                     }
                 }
             }
         }
-        Ok(ProxyState {
+        Ok(ProxyConfig {
             target_pools,
             port_to_pool,
-            port_to_rr_counter,
-            target_status,
         })
     }
 }
