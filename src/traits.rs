@@ -10,6 +10,9 @@ use std::{collections::HashMap, future::Future};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::timeout;
 
+// TODO: split this into at least two files: balancer.rs and network.rs. Maybe network is a
+// directory and it has mod, tokio, mock, etc.
+
 pub trait LoadBalancer: Send + Sync {
     type Resolver: Resolver;
     type Connector: StreamConnector;
@@ -104,28 +107,20 @@ where
             // TODO: consider caching resolved hosts
             // Also consider moving resolution to a background task and updating no later than the
             // time to live for the resolved address.
-            let sock_addr = match self.resolver.lookup_host(target).await {
-                Ok(mut sock_addrs) => match sock_addrs.next() {
-                    Some(a) => a,
-                    None => {
-                        let _ = self
-                            .targets
-                            .update_target_status(target, BackendStatus::Drain);
-                        eprintln!(
-                            "DNS resolution failed for {target}: No IP address found for port {for_port}"
-                        );
-                        continue;
-                    }
-                },
-                Err(_) => {
-                    let _ = self
-                        .targets
-                        .update_target_status(target, BackendStatus::Drain);
-                    eprintln!(
-                        "DNS resolution failed for {target}: No IP address found for port {for_port}"
-                    );
-                    continue;
-                }
+            let Some(sock_addr) = self
+                .resolver
+                .lookup_host(target)
+                .await
+                .ok()
+                .and_then(|mut addrs| addrs.next())
+            else {
+                let _ = self
+                    .targets
+                    .update_target_status(target, BackendStatus::Drain);
+                eprintln!(
+                    "DNS resolution failed for {target}: No IP address found for port {for_port}"
+                );
+                continue;
             };
             // TODO: This deadline and the delays below should be in config
             let connect_timeout = Duration::from_secs(5);
