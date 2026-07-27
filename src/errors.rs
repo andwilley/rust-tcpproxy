@@ -1,9 +1,6 @@
-use std::io::ErrorKind;
 use thiserror::Error;
 
-use serde_json::error::Category;
-
-#[derive(Error, Debug, Clone, PartialEq, Eq)]
+#[derive(Error, Debug)]
 pub enum ProxyError {
     #[error("No target found for backend named {name}")]
     BackendNotFound { name: String },
@@ -20,30 +17,15 @@ pub enum ProxyError {
     #[error("Error in Proxy state: {message}")]
     ProxyStateError { message: String },
 
-    #[error("Network I/O error {kind}: {message}")]
-    IoError { kind: ErrorKind, message: String },
+    #[error("Network I/O error {0}")]
+    IoError(#[from] std::io::Error),
 
-    #[error("Json parse error {category:?}: {message}")]
-    JsonError { category: Category, message: String },
+    #[error("Json parse error {0}")]
+    JsonError(#[from] serde_json::Error),
 
     #[error("A task was cancelled: {message}")]
     TaskCancellation { message: String },
-}
 
-impl From<std::io::Error> for ProxyError {
-    fn from(e: std::io::Error) -> Self {
-        ProxyError::IoError {
-            kind: e.kind(),
-            message: e.to_string(),
-        }
-    }
-}
-
-impl From<serde_json::Error> for ProxyError {
-    fn from(e: serde_json::Error) -> Self {
-        ProxyError::JsonError {
-            category: e.classify(),
-            message: e.to_string(),
-        }
-    }
+    #[error("Error acquiring semaphore permit {0}")]
+    QueueAcquireError(#[from] tokio::sync::AcquireError),
 }

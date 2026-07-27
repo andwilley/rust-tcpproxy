@@ -1,29 +1,15 @@
+use crate::balancer::traits::LoadBalancer;
 use crate::errors::ProxyError;
+use crate::network::traits::{Resolver, StreamConnector};
 use crate::state::{BackendStatus, ProxyConfig, TargetState};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 use std::time::Instant;
-use std::{collections::HashMap, future::Future};
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::timeout;
-
-// TODO: split this into at least two files: balancer.rs and network.rs. Maybe network is a
-// directory and it has mod, tokio, mock, etc.
-
-pub trait LoadBalancer: Send + Sync {
-    type Resolver: Resolver;
-    type Connector: StreamConnector;
-
-    fn connect_backend(
-        &self,
-        for_port: u16,
-    ) -> impl Future<
-        Output = Result<(<Self::Connector as StreamConnector>::Stream, SocketAddr), ProxyError>,
-    > + Send;
-}
 
 pub struct RoundRobinBalancer<R, C> {
     config: Arc<ProxyConfig>,
@@ -32,6 +18,7 @@ pub struct RoundRobinBalancer<R, C> {
     resolver: R,
     connector: C,
 }
+
 impl<R, C> RoundRobinBalancer<R, C> {
     pub fn new(config: Arc<ProxyConfig>, targets: TargetState, resolver: R, connector: C) -> Self
     where
@@ -51,6 +38,7 @@ impl<R, C> RoundRobinBalancer<R, C> {
         }
     }
 }
+
 impl<R, C> LoadBalancer for RoundRobinBalancer<R, C>
 where
     R: Resolver,
@@ -62,13 +50,7 @@ where
     async fn connect_backend(
         &self,
         for_port: u16,
-    ) -> Result<
-        (
-            <<Self as LoadBalancer>::Connector as StreamConnector>::Stream,
-            SocketAddr,
-        ),
-        ProxyError,
-    > {
+    ) -> Result<(<Self::Connector as StreamConnector>::Stream, SocketAddr), ProxyError> {
         let Some(backends) = &self.config.get_pool(for_port) else {
             return Err(ProxyError::TargetResolutionError {
                 port: for_port,
@@ -92,7 +74,7 @@ where
             }
         };
 
-        // Consider a fall back if all backends are cooling down
+        // Consider a fall back if all backends are cooling down, pick the coolest
         for i in 0..backends.len() {
             let target = &backends[(start_idx + i) % backends.len()];
             {
@@ -150,78 +132,5 @@ where
             port: for_port,
             message: format!("Unable to connect to any backend for port {for_port}"),
         })
-    }
-}
-
-pub trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
-
-pub trait StreamListenerFactory: Send + Sync + Clone {
-    type Listener: StreamListener;
-    fn bind(&self, addr: String)
-    -> impl Future<Output = Result<Self::Listener, ProxyError>> + Send;
-}
-
-pub trait StreamListener: Send + Sync {
-    type Stream: AsyncStream;
-    fn accept(&self)
-    -> impl Future<Output = Result<(Self::Stream, SocketAddr), ProxyError>> + Send;
-}
-
-pub trait Resolver: Send + Sync + Clone {
-    fn lookup_host(
-        &self,
-        host: &str,
-    ) -> impl Future<Output = Result<impl Iterator<Item = SocketAddr>, ProxyError>> + Send;
-}
-
-pub trait StreamConnector: Send + Sync + Clone {
-    type Stream: AsyncStream;
-    fn connect(
-        &self,
-        addr: SocketAddr,
-    ) -> impl Future<Output = Result<Self::Stream, ProxyError>> + Send;
-}
-
-#[derive(Clone)]
-pub struct TokioStreamListenerFactory;
-impl StreamListenerFactory for TokioStreamListenerFactory {
-    type Listener = TokioListener;
-    async fn bind(&self, addr: String) -> Result<Self::Listener, ProxyError> {
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        Ok(TokioListener(listener))
-    }
-}
-
-pub struct TokioListener(pub tokio::net::TcpListener);
-impl StreamListener for TokioListener {
-    type Stream = tokio::net::TcpStream;
-    async fn accept(&self) -> Result<(Self::Stream, SocketAddr), ProxyError> {
-        let (stream, addr) = self.0.accept().await?;
-        stream.set_nodelay(true)?;
-        Ok((stream, addr))
-    }
-}
-
-#[derive(Clone)]
-pub struct TokioResolver;
-impl Resolver for TokioResolver {
-    async fn lookup_host(
-        &self,
-        host: &str,
-    ) -> Result<impl Iterator<Item = SocketAddr>, ProxyError> {
-        let addrs = tokio::net::lookup_host(host).await?;
-        Ok(addrs)
-    }
-}
-
-#[derive(Clone)]
-pub struct TokioConnector;
-impl StreamConnector for TokioConnector {
-    type Stream = tokio::net::TcpStream;
-    async fn connect(&self, addr: SocketAddr) -> Result<Self::Stream, ProxyError> {
-        let stream = tokio::net::TcpStream::connect(addr).await?;
-        stream.set_nodelay(true)?;
-        Ok(stream)
     }
 }

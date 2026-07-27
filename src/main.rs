@@ -1,11 +1,10 @@
+use tcpproxy::balancer::roundrobin::RoundRobinBalancer;
 use tcpproxy::errors::ProxyError;
+use tcpproxy::network::tokio::{TokioConnector, TokioResolver, TokioStreamListenerFactory};
 use tcpproxy::state::TargetState;
-use tcpproxy::traits::{
-    RoundRobinBalancer, TokioConnector, TokioResolver, TokioStreamListenerFactory,
-};
 use tokio::select;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 use clap::Parser;
 use std::path::PathBuf;
@@ -18,10 +17,19 @@ struct Args {
     /// Configuration file for this proxy instance
     #[arg(long)]
     config: PathBuf,
+
+    /// Maximum number of concurrent connections to allow.
+    #[arg(long, default_value_t = 10000)]
+    max_connections: usize,
+
+    /// Maximum number of queued connections to allow (not to be confused with the maximum dynamic
+    /// pressure and aerodynamic stress on the proxy).
+    #[arg(long, default_value_t = 100)]
+    max_queue: usize,
 }
 
 // Push a forced shutdown over the channel. Eventually use this to drain connections properly.
-async fn shutdown_signal(shutdown_tx: watch::Sender<()>) {
+async fn shutdown_signal(cancel_token: CancellationToken) {
     let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
 
     select! {
@@ -33,7 +41,7 @@ async fn shutdown_signal(shutdown_tx: watch::Sender<()>) {
         }
     }
 
-    let _ = shutdown_tx.send(());
+    cancel_token.cancel();
 }
 
 #[tokio::main]
@@ -43,14 +51,16 @@ async fn main() -> Result<(), ProxyError> {
     let config = Arc::new(ProxyConfig::try_from(&raw_config)?);
     let targets = TargetState::try_from(&raw_config)?;
 
-    let (shutdown_tx, shutdown_rx) = watch::channel(());
-    tokio::spawn(shutdown_signal(shutdown_tx));
+    let cancel_token = CancellationToken::new();
+    tokio::spawn(shutdown_signal(cancel_token.clone()));
 
     proxy::ProxyServer::new(
         TokioStreamListenerFactory,
         RoundRobinBalancer::new(config.clone(), targets, TokioResolver, TokioConnector),
         config.clone(),
-        shutdown_rx,
+        cancel_token,
+        args.max_connections,
+        args.max_queue,
     )
     .run()
     .await?;
