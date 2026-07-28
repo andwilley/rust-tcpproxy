@@ -1,6 +1,6 @@
 use tcpproxy::balancer::roundrobin::RoundRobinBalancer;
 use tcpproxy::errors::ProxyError;
-use tcpproxy::network::tokio::{TokioConnector, TokioResolver, TokioStreamListenerFactory};
+use tcpproxy::network::tokio::{HickoryTokioResolver, TokioConnector, TokioStreamListenerFactory};
 use tcpproxy::state::TargetState;
 use tokio::select;
 use tokio::signal::unix::{SignalKind, signal};
@@ -56,7 +56,12 @@ async fn main() -> Result<(), ProxyError> {
 
     proxy::ProxyServer::new(
         TokioStreamListenerFactory,
-        RoundRobinBalancer::new(config.clone(), targets, TokioResolver, TokioConnector),
+        RoundRobinBalancer::new(
+            config.clone(),
+            targets,
+            HickoryTokioResolver(hickory_resolver::Resolver::builder_tokio()?.build()?),
+            TokioConnector,
+        ),
         config.clone(),
         cancel_token,
         args.max_connections,

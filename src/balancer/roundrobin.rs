@@ -74,7 +74,7 @@ where
             }
         };
 
-        // Consider a fall back if all backends are cooling down, pick the coolest
+        // TODO: Consider a fall back if all backends are cooling down, cycle though by coolest
         for i in 0..backends.len() {
             let target = &backends[(start_idx + i) % backends.len()];
             {
@@ -86,47 +86,55 @@ where
                 }
             }
 
-            // TODO: consider caching resolved hosts
-            // Also consider moving resolution to a background task and updating no later than the
-            // time to live for the resolved address.
-            let Some(sock_addr) = self
-                .resolver
-                .lookup_host(target)
-                .await
-                .ok()
-                .and_then(|mut addrs| addrs.next())
-            else {
-                let _ = self
-                    .targets
-                    .update_target_status(target, BackendStatus::Drain);
-                eprintln!(
-                    "DNS resolution failed for {target}: No IP address found for port {for_port}"
-                );
-                continue;
-            };
-            // TODO: This deadline and the delays below should be in config
-            let connect_timeout = Duration::from_secs(5);
-            match timeout(connect_timeout, self.connector.connect(sock_addr)).await {
-                // Reset cooldown to empty here
-                Ok(Ok(stream)) => return Ok((stream, sock_addr)),
-                Ok(Err(e)) => {
-                    let _ = self.targets.update_target_status(
-                        target,
-                        BackendStatus::Alive(Some(Instant::now() + Duration::from_mins(30))),
-                    );
-                    eprintln!("failed to connect to backend target {target}: {e}");
-                }
-                Err(_) => {
-                    let _ = self.targets.update_target_status(
-                        target,
-                        BackendStatus::Alive(Some(Instant::now() + Duration::from_mins(30))),
-                    );
+            let sock_addrs = match self.resolver.lookup_host(target).await {
+                Ok(ips) => ips,
+                Err(ProxyError::DnsNxError { message }) => {
+                    let _ = self
+                        .targets
+                        .update_target_status(target, BackendStatus::Drain);
                     eprintln!(
-                        "connection to target {target} timed out after {:?}",
-                        connect_timeout
+                        "DNS resolution failed for {target}: No IP addresses found for port {for_port}. {message}"
                     );
+                    continue;
+                }
+                Err(ProxyError::DnsTransientError { message }) => {
+                    // TODO: This delay should be a progressive backoff with jitter
+                    let _ = self.targets.update_target_status(
+                        target,
+                        BackendStatus::Alive(Some(Instant::now() + Duration::from_mins(30))),
+                    );
+                    eprintln!("DNS resolution failed for {target}:{for_port}. {message}");
+                    continue;
+                }
+                Err(e) => {
+                    return Err(e);
                 }
             };
+            for sock_addr in sock_addrs {
+                // TODO: This deadline should be in config
+                let connect_timeout = Duration::from_secs(5);
+                match timeout(connect_timeout, self.connector.connect(sock_addr)).await {
+                    Ok(Ok(stream)) => return Ok((stream, sock_addr)),
+                    Ok(Err(e)) => {
+                        eprintln!(
+                            "failed to connect to backend target {target} at {sock_addr}: {e}"
+                        );
+                        continue;
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "connection to target {target} timed out after {:?}",
+                            connect_timeout
+                        );
+                        continue;
+                    }
+                };
+            }
+            // TODO: This delay should be a progressive backoff with jitter
+            let _ = self.targets.update_target_status(
+                target,
+                BackendStatus::Alive(Some(Instant::now() + Duration::from_mins(30))),
+            );
         }
         Err(ProxyError::ConnectionError {
             port: for_port,

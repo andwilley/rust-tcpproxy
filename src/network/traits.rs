@@ -21,7 +21,7 @@ pub trait Resolver: Send + Sync + Clone {
     fn lookup_host(
         &self,
         host: &str,
-    ) -> impl Future<Output = Result<impl Iterator<Item = SocketAddr>, ProxyError>> + Send;
+    ) -> impl Future<Output = Result<Vec<SocketAddr>, ProxyError>> + Send;
 }
 
 pub trait StreamConnector: Send + Sync + Clone {

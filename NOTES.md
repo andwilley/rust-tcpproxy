@@ -57,3 +57,15 @@ copybidir uses 8KB by default and its not configurable. it does implement backpr
 
 * improve cooldown logic for backends
 * handle DNS lookup transient errors better
+
+## Logging and metrics
+
+printing errors doesn't scale. we'd need a logging / telemetry framework for monitoring the state and history of the proxy, error logging, alerting, etc
+
+## global semaphore
+
+I use a this to manage memory ceiling. This could be combined with a "fairness" quota per port as well if thats needed.
+
+## arcswap justification
+
+The enum was designed to need minimal updates and we expect backend failures to be rare relative to normal operation. ArcSwap allows us to optimize for the read path without dealing with the cache bounce penalty for rwlocks or mutexes. The obvious downside is that if many backends start failing, we suffer a big as writes to the target state map will be more common, but in a situation like that, its probably that the penalty for writing / swapping heap refs is overshadowed by the failing backends.
