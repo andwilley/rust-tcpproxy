@@ -8,6 +8,9 @@ pub enum ProxyError {
     #[error("Error ingesting proxy config: {message}")]
     ConfigIngestError { message: String },
 
+    #[error("Address {addr} is invalid: {message}")]
+    BadAddressError { addr: String, message: String },
+
     #[error("Error resolving targets for {port}: {message}")]
     TargetResolutionError { port: u16, message: String },
 
@@ -28,4 +31,24 @@ pub enum ProxyError {
 
     #[error("Error acquiring semaphore permit {0}")]
     QueueAcquireError(#[from] tokio::sync::AcquireError),
+
+    #[error("Transient DNS error: {message}")]
+    DnsTransientError { message: String },
+
+    #[error("Transient DNS error: {message}")]
+    DnsNxError { message: String },
+}
+
+impl From<hickory_resolver::net::NetError> for ProxyError {
+    fn from(e: hickory_resolver::net::NetError) -> Self {
+        if e.is_nx_domain() || e.is_no_records_found() {
+            ProxyError::DnsNxError {
+                message: e.to_string(),
+            }
+        } else {
+            ProxyError::DnsTransientError {
+                message: e.to_string(),
+            }
+        }
+    }
 }

@@ -1,3 +1,5 @@
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+
 use crate::{
     errors::ProxyError,
     network::traits::{Resolver, StreamConnector, StreamListener, StreamListenerFactory},
@@ -25,14 +27,26 @@ impl StreamListener for TokioListener {
 }
 
 #[derive(Clone)]
-pub struct TokioResolver;
-impl Resolver for TokioResolver {
-    async fn lookup_host(
-        &self,
-        host: &str,
-    ) -> Result<impl Iterator<Item = SocketAddr>, ProxyError> {
-        let addrs = tokio::net::lookup_host(host).await?;
-        Ok(addrs)
+pub struct HickoryTokioResolver(pub hickory_resolver::Resolver<TokioRuntimeProvider>);
+impl Resolver for HickoryTokioResolver {
+    async fn lookup_host(&self, host: &str) -> Result<Vec<SocketAddr>, ProxyError> {
+        let Some((hostname, port_string)) = host.split_once(":") else {
+            return Err(ProxyError::BadAddressError {
+                addr: host.to_string(),
+                message: "could not split into host and port".to_string(),
+            });
+        };
+        let Ok(port) = port_string.parse::<u16>() else {
+            return Err(ProxyError::BadAddressError {
+                addr: host.to_string(),
+                message: "could not parse port as u16".to_string(),
+            });
+        };
+        let addrs = self.0.lookup_ip(hostname).await?;
+        Ok(addrs
+            .iter()
+            .map(|addr| SocketAddr::new(addr, port))
+            .collect())
     }
 }
 
