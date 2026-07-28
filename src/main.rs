@@ -1,13 +1,16 @@
 use tcpproxy::balancer::roundrobin::RoundRobinBalancer;
 use tcpproxy::errors::ProxyError;
+use tcpproxy::logswriter::LogsWriter;
 use tcpproxy::network::tokio::{HickoryTokioResolver, TokioConnector, TokioStreamListenerFactory};
 use tcpproxy::state::TargetState;
 use tokio::select;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_util::sync::CancellationToken;
+use tracing::{error, info};
 
 use clap::Parser;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::Arc;
 use tcpproxy::{config::RawConfig, proxy, state::ProxyConfig};
 
@@ -26,27 +29,33 @@ struct Args {
     /// pressure and aerodynamic stress on the proxy).
     #[arg(long, default_value_t = 100)]
     max_queue: usize,
+
+    #[arg(long, default_value_t = LogsWriter::StdErr)]
+    logs_writer: LogsWriter,
 }
 
-// Push a forced shutdown over the channel. Eventually use this to drain connections properly.
 async fn shutdown_signal(cancel_token: CancellationToken) {
     let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
 
     select! {
         _ = tokio::signal::ctrl_c() => {
-            println!("SIGINT received: shutting down");
+            info!("SIGINT received: shutting down");
         }
         _ = sigterm.recv() => {
-            println!("SIGTERM received: shutting down");
+            info!("SIGTERM received: shutting down");
         }
     }
 
     cancel_token.cancel();
 }
 
-#[tokio::main]
-async fn main() -> Result<(), ProxyError> {
+async fn run() -> Result<(), ProxyError> {
     let args = Args::parse();
+
+    tracing_subscriber::fmt()
+        .with_writer(args.logs_writer.into_make_writer())
+        .init();
+
     let raw_config = RawConfig::load_from_file(args.config)?;
     let config = Arc::new(ProxyConfig::try_from(&raw_config)?);
     let targets = TargetState::try_from(&raw_config)?;
@@ -71,4 +80,13 @@ async fn main() -> Result<(), ProxyError> {
     .await?;
 
     Ok(())
+}
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    if let Err(e) = run().await {
+        error!(err = %e, "exiting: fatal error");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
 }

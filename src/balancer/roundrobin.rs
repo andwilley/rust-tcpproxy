@@ -10,6 +10,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::time::timeout;
+use tracing::error;
 
 pub struct RoundRobinBalancer<R, C> {
     config: Arc<ProxyConfig>,
@@ -92,8 +93,9 @@ where
                     let _ = self
                         .targets
                         .update_target_status(target, BackendStatus::Drain);
-                    eprintln!(
-                        "DNS resolution failed for {target}: No IP addresses found for port {for_port}. {message}"
+                    error!(
+                        port = for_port,
+                        target, message, "DNS resolution failed: No IP addresses found",
                     );
                     continue;
                 }
@@ -103,7 +105,7 @@ where
                         target,
                         BackendStatus::Alive(Some(Instant::now() + Duration::from_mins(30))),
                     );
-                    eprintln!("DNS resolution failed for {target}:{for_port}. {message}");
+                    error!(port = for_port, target, message, "DNS resolution failed");
                     continue;
                 }
                 Err(e) => {
@@ -116,14 +118,21 @@ where
                 match timeout(connect_timeout, self.connector.connect(sock_addr)).await {
                     Ok(Ok(stream)) => return Ok((stream, sock_addr)),
                     Ok(Err(e)) => {
-                        eprintln!(
-                            "failed to connect to backend target {target} at {sock_addr}: {e}"
+                        error!(
+                            port = for_port,
+                            target,
+                            socket_address = %sock_addr,
+                            err = %e,
+                            "failed to connect to backend/port",
                         );
                         continue;
                     }
                     Err(_) => {
-                        eprintln!(
-                            "connection to target {target} timed out after {:?}",
+                        error!(
+                            port = for_port,
+                            target,
+                            socket_address = %sock_addr,
+                            "connection to target timed out after {:?}",
                             connect_timeout
                         );
                         continue;
