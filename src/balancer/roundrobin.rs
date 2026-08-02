@@ -1,7 +1,9 @@
-use crate::balancer::traits::LoadBalancer;
+use crate::balancer::traits::{
+    ConnectResult::Failure, ConnectResult::Success, CooldownHandler, LoadBalancer,
+};
 use crate::errors::ProxyError;
 use crate::network::traits::{Resolver, StreamConnector};
-use crate::state::{BackendStatus, ProxyConfig, TargetState};
+use crate::state::{BackendStatus, ProxyConfig};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -12,19 +14,20 @@ use std::time::Instant;
 use tokio::time::timeout;
 use tracing::error;
 
-pub struct RoundRobinBalancer<R, C> {
+pub struct RoundRobinBalancer<R, C, B> {
     config: Arc<ProxyConfig>,
-    targets: Arc<TargetState>,
     port_to_rr_counter: HashMap<u16, AtomicUsize>,
     resolver: R,
     connector: C,
+    cooldown: B,
 }
 
-impl<R, C> RoundRobinBalancer<R, C> {
-    pub fn new(config: Arc<ProxyConfig>, targets: TargetState, resolver: R, connector: C) -> Self
+impl<R, C, B> RoundRobinBalancer<R, C, B> {
+    pub fn new(config: Arc<ProxyConfig>, resolver: R, connector: C, cooldown: B) -> Self
     where
         R: Resolver,
         C: StreamConnector,
+        B: CooldownHandler,
     {
         let mut counters = HashMap::<u16, AtomicUsize>::new();
         for port in config.ports() {
@@ -32,21 +35,23 @@ impl<R, C> RoundRobinBalancer<R, C> {
         }
         RoundRobinBalancer {
             config,
-            targets: Arc::new(targets),
             port_to_rr_counter: counters,
             resolver,
             connector,
+            cooldown,
         }
     }
 }
 
-impl<R, C> LoadBalancer for RoundRobinBalancer<R, C>
+impl<R, C, B> LoadBalancer for RoundRobinBalancer<R, C, B>
 where
     R: Resolver,
     C: StreamConnector,
+    B: CooldownHandler,
 {
     type Resolver = R;
     type Connector = C;
+    type Cooldown = B;
 
     async fn connect_backend(
         &self,
@@ -75,14 +80,17 @@ where
             }
         };
 
-        // TODO: Consider a fall back if all backends are cooling down, cycle though by coolest
+        // TODO: Consider a fall back if all backends are cooling down, cycle though by coolest and
+        // if one succeeds reset the cooldown to now or null.
         for i in 0..backends.len() {
             let target = &backends[(start_idx + i) % backends.len()];
             {
-                let target_status = self.targets.get_target_status(target)?;
-                match **target_status {
+                let target_status = self.cooldown.get_target_status(target)?;
+                match target_status {
                     BackendStatus::Drain => continue,
-                    BackendStatus::Alive(Some(time)) if time > Instant::now() => continue,
+                    BackendStatus::Alive {
+                        cool_until: Some(time),
+                    } if time > Instant::now() => continue,
                     _ => {}
                 }
             }
@@ -90,9 +98,7 @@ where
             let sock_addrs = match self.resolver.lookup_host(target).await {
                 Ok(ips) => ips,
                 Err(ProxyError::DnsNxError { message }) => {
-                    let _ = self
-                        .targets
-                        .update_target_status(target, BackendStatus::Drain);
+                    let _ = self.cooldown.drain(target);
                     error!(
                         port = for_port,
                         target, message, "DNS resolution failed: No IP addresses found",
@@ -100,11 +106,7 @@ where
                     continue;
                 }
                 Err(ProxyError::DnsTransientError { message }) => {
-                    // TODO: This delay should be a progressive backoff with jitter
-                    let _ = self.targets.update_target_status(
-                        target,
-                        BackendStatus::Alive(Some(Instant::now() + Duration::from_mins(30))),
-                    );
+                    let _ = self.cooldown.report_connection_attempt(target, Failure);
                     error!(port = for_port, target, message, "DNS resolution failed");
                     continue;
                 }
@@ -113,10 +115,12 @@ where
                 }
             };
             for sock_addr in sock_addrs {
-                // TODO: This deadline should be in config
                 let connect_timeout = Duration::from_secs(5);
                 match timeout(connect_timeout, self.connector.connect(sock_addr)).await {
-                    Ok(Ok(stream)) => return Ok((stream, sock_addr)),
+                    Ok(Ok(stream)) => {
+                        self.cooldown.report_connection_attempt(target, Success)?;
+                        return Ok((stream, sock_addr));
+                    }
                     Ok(Err(e)) => {
                         error!(
                             port = for_port,
@@ -139,11 +143,7 @@ where
                     }
                 };
             }
-            // TODO: This delay should be a progressive backoff with jitter
-            let _ = self.targets.update_target_status(
-                target,
-                BackendStatus::Alive(Some(Instant::now() + Duration::from_mins(30))),
-            );
+            let _ = self.cooldown.report_connection_attempt(target, Failure);
         }
         Err(ProxyError::ConnectionError {
             port: for_port,

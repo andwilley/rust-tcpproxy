@@ -5,6 +5,7 @@ use crate::state::ProxyConfig;
 use std::io::ErrorKind::{
     AddrInUse, AddrNotAvailable, InvalidData, InvalidInput, PermissionDenied,
 };
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::select;
@@ -95,55 +96,17 @@ where
     loop {
         select! {
             accept_result = listener.accept() => {
-                let (in_sock, _source_addr) = match accept_result {
-                    Ok(res) => res,
-                    Err(e) => {
-                        if let ProxyError::IoError(ref io_err) = e {
-                            let kind = io_err.kind();
-                            if matches!(
-                                kind,
-                                InvalidInput |
-                                InvalidData |
-                                PermissionDenied |
-                                AddrInUse |
-                                AddrNotAvailable
-                            ) {
-                                error!(port, err = %e, "fatal error on accept");
-                                return Err(e);
-                            }
-                            error!(port, err = %e, "transient error on accept");
-                            tokio::time::sleep(Duration::from_millis(50)).await;
-                            continue;
-                        }
-                        return Err(e);
-                    }
-                };
-                let new_balancer = balancer.clone();
-                if let Ok(permit) = open_connections.clone().try_acquire_owned() {
-                    connections.spawn(async move {
-                        let _permit = permit;
-                        if let Err(e) = do_connection(port, in_sock, new_balancer).await {
-                            error!(port, err = %e, "Connection to backends failed")
-                        }
-                    });
-                    continue;
-                };
-
-                if let Ok(queue_slot) = queued_connections.clone().try_acquire_owned() {
-                    let new_open_connections = open_connections.clone();
-                    connections.spawn(async move {
-                        let Ok(_permit) = new_open_connections.clone().acquire_owned().await else {
-                            return;
-                        };
-                        drop(queue_slot);
-                        if let Err(e) = do_connection(port, in_sock, new_balancer).await {
-                            error!(port, err = %e, "Connection to backends failed")
-                        }
-                    });
-                    continue;
-                }
-                error!(port, "Connection dropped, too many connections");
-                continue;
+                let Err(e) = accept_connection(
+                        accept_result,
+                        port,
+                        balancer.clone(),
+                        open_connections.clone(),
+                        queued_connections.clone(),
+                        &mut connections
+                    ).await else {
+                        continue;
+                    };
+                return Err(e);
             }
             _ = cancel_token.cancelled() => {
                 break;
@@ -161,6 +124,66 @@ where
         }
     }
     Ok(())
+}
+
+/// If capacity is available in the active pool or the queue, spawn a task to connect this request.
+async fn accept_connection<B, S>(
+    accept_result: Result<(S, SocketAddr), ProxyError>,
+    port: u16,
+    balancer: Arc<B>,
+    open_connections: Arc<Semaphore>,
+    queued_connections: Arc<Semaphore>,
+    connections: &mut JoinSet<()>,
+) -> Result<(), ProxyError>
+where
+    B: LoadBalancer + 'static,
+    S: AsyncStream,
+{
+    let (in_sock, _source_addr) = match accept_result {
+        Ok(res) => res,
+        Err(e) => {
+            if let ProxyError::IoError(ref io_err) = e {
+                let kind = io_err.kind();
+                if matches!(
+                    kind,
+                    InvalidInput | InvalidData | PermissionDenied | AddrInUse | AddrNotAvailable
+                ) {
+                    error!(port, err = %e, "fatal error on accept");
+                    return Err(e);
+                }
+                error!(port, err = %e, "transient error on accept");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                return Ok(());
+            }
+            return Err(e);
+        }
+    };
+    let new_balancer = balancer.clone();
+    if let Ok(permit) = open_connections.clone().try_acquire_owned() {
+        connections.spawn(async move {
+            let _permit = permit;
+            if let Err(e) = do_connection(port, in_sock, new_balancer).await {
+                error!(port, err = %e, "Connection to backends failed")
+            }
+        });
+        return Ok(());
+    };
+
+    if let Ok(queue_slot) = queued_connections.clone().try_acquire_owned() {
+        let new_open_connections = open_connections.clone();
+        connections.spawn(async move {
+            let Ok(_permit) = new_open_connections.clone().acquire_owned().await else {
+                return;
+            };
+            drop(queue_slot);
+            if let Err(e) = do_connection(port, in_sock, new_balancer).await {
+                error!(port, err = %e, "Connection to backends failed")
+            }
+        });
+        return Ok(());
+    }
+    error!(port, "Connection dropped, too many connections");
+    return Ok(());
 }
 
 async fn do_connection<S, B>(port: u16, mut in_sock: S, balancer: Arc<B>) -> Result<(), ProxyError>

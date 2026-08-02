@@ -6,9 +6,6 @@ use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::time::Instant;
 
-// TODO: the rr_counter should actually live on a struct that impls the loadbalancer trait
-// And the proxystate just holds a load balancer, or maybe it doesn't and the server needs a load
-// balancer to construct itself.
 pub struct ProxyConfig {
     target_pools: Vec<Vec<String>>,
     port_to_pool: HashMap<u16, usize>,
@@ -18,10 +15,11 @@ pub struct TargetState {
     target_status: HashMap<String, ArcSwap<BackendStatus>>,
 }
 
+#[derive(Clone, Copy)]
 pub enum BackendStatus {
-    /// Don't call this backend until the specified Some(time).
-    // TODO: name this field
-    Alive(Option<Instant>),
+    Alive {
+        cool_until: Option<Instant>,
+    },
     Drain,
 }
 
@@ -72,7 +70,7 @@ impl TryFrom<&RawConfig> for TargetState {
             for target in &app.targets {
                 target_status.insert(
                     target.clone(),
-                    ArcSwap::from_pointee(BackendStatus::Alive(None)),
+                    ArcSwap::from_pointee(BackendStatus::Alive { cool_until: None }),
                 );
             }
         }
