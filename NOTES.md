@@ -39,24 +39,27 @@
 * we could also base our resolve-ahead strategy on the load balancing implementation if we can
 * wouldn't want to be resolving all the time if there isn't the traffic to support it
 
+we get caching from hickory, we can tune the cache to ensure good performance, but we do still accept some synchonous lookups.
+
 ## backpressure
 
-We need to limit the number of connecitons based on available memory. Should we do this per port?
+we limit number of connections via flag, as well as queue size. We use this strictly as a way to control total memory usage. This could be made more fair by enforcing per port quotas, but that seems fraught with assumptions about which traffic is critical for the client. We could also strictly bound the queue wait time to avoid long delays by waiting in the queue, but this can be tuned via the relative sizes of max connections and queue for now.
 
 Make sure file descriptor limit is high enough at the OS level.
 
-Make sure we shed load rather than queuing unbounded.
-
 Should there be some max number of ports in a config? how many should we listen on at once?
+
+consider a queue wait time as a flag
+
+## Cooldown logic
+
+We should be backing off, that algo should be in config
+
+We need to retry still cooling backends if we fail to connect to any. If we do connect to a coolling backend, we must reset it.
 
 ## buffer sizes
 
 copybidir uses 8KB by default and its not configurable. it does implement backpressure when one side writes way faster than the other. To make that configurable, we'd have to roll out own.
-
-## Trasient failure tolerance
-
-* improve cooldown logic for backends
-* handle DNS lookup transient errors better
 
 ## Logging and metrics
 
@@ -69,3 +72,9 @@ I use a this to manage memory ceiling. This could be combined with a "fairness" 
 ## arcswap justification
 
 The enum was designed to need minimal updates and we expect backend failures to be rare relative to normal operation. ArcSwap allows us to optimize for the read path without dealing with the cache bounce penalty for rwlocks or mutexes. The obvious downside is that if many backends start failing, we suffer a big as writes to the target state map will be more common, but in a situation like that, its probably that the penalty for writing / swapping heap refs is overshadowed by the failing backends.
+
+## TODO: Extreme edge cases
+
+* all backends fail to connect at the same time
+* DNS outage
+* malicous clients (slow loris, etc)

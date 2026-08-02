@@ -12,6 +12,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
 
 pub struct ProxyServer<L, B> {
     listener_factory: L,
@@ -59,7 +60,7 @@ where
         }
         while let Some(res) = handles.join_next().await {
             match res {
-                Ok(Ok(())) => println!("A listener exited successfully"),
+                Ok(Ok(())) => debug!("A listener exited successfully"),
                 Ok(Err(listen_error)) => {
                     return Err(listen_error);
                 }
@@ -99,11 +100,18 @@ where
                     Err(e) => {
                         if let ProxyError::IoError(ref io_err) = e {
                             let kind = io_err.kind();
-                            if matches!(kind, InvalidInput | InvalidData | PermissionDenied | AddrInUse | AddrNotAvailable) {
-                                eprintln!("fatal error on accept for port {port}");
+                            if matches!(
+                                kind,
+                                InvalidInput |
+                                InvalidData |
+                                PermissionDenied |
+                                AddrInUse |
+                                AddrNotAvailable
+                            ) {
+                                error!(port, err = %e, "fatal error on accept");
                                 return Err(e);
                             }
-                            eprintln!("transient error on accept for port {port}");
+                            error!(port, err = %e, "transient error on accept");
                             tokio::time::sleep(Duration::from_millis(50)).await;
                             continue;
                         }
@@ -115,7 +123,7 @@ where
                     connections.spawn(async move {
                         let _permit = permit;
                         if let Err(e) = do_connection(port, in_sock, new_balancer).await {
-                            eprintln!("Connection to backends for port {port} failed: {e}")
+                            error!(port, err = %e, "Connection to backends failed")
                         }
                     });
                     continue;
@@ -129,12 +137,12 @@ where
                         };
                         drop(queue_slot);
                         if let Err(e) = do_connection(port, in_sock, new_balancer).await {
-                            eprintln!("Connection to backends for port {port} failed: {e}")
+                            error!(port, err = %e, "Connection to backends failed")
                         }
                     });
                     continue;
                 }
-                eprintln!("Connection dropped for port {port}, too many connections");
+                error!(port, "Connection dropped, too many connections");
                 continue;
             }
             _ = cancel_token.cancelled() => {
@@ -143,13 +151,13 @@ where
         }
     }
 
-    println!("Shutting down, attempting to drain open connections.");
+    info!(port, "Shutting down, attempting to drain open connections.");
     select! {
         _ = async {
             while connections.join_next().await.is_some() {}
         } => {}
         _ = sleep(Duration::from_secs(10)) => {
-            println!("Shutdown deadline reached, aborting.")
+            warn!(port, "Shutdown deadline reached, aborting.")
         }
     }
     Ok(())
