@@ -3,8 +3,8 @@ use std::future::Future;
 use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-pub trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
+pub trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncStream for T {}
 
 pub trait StreamListenerFactory: Send + Sync + Clone {
     type Listener: StreamListener;
@@ -17,14 +17,14 @@ pub trait StreamListener: Send + Sync {
     -> impl Future<Output = Result<(Self::Stream, SocketAddr), ProxyError>> + Send;
 }
 
-pub trait Resolver: Send + Sync + Clone {
+pub trait Resolver: Send + Sync + Clone + 'static {
     fn lookup_host(
         &self,
         host: &str,
     ) -> impl Future<Output = Result<Vec<SocketAddr>, ProxyError>> + Send;
 }
 
-pub trait StreamConnector: Send + Sync + Clone {
+pub trait StreamConnector: Send + Sync + Clone + 'static {
     type Stream: AsyncStream;
     fn connect(
         &self,

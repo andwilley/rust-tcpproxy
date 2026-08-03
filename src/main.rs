@@ -1,4 +1,5 @@
 use tcpproxy::balancer::roundrobin::RoundRobinBalancer;
+use tcpproxy::balancer::simplecooldownhandler::SimpleCooldownHandler;
 use tcpproxy::errors::ProxyError;
 use tcpproxy::logswriter::LogsWriter;
 use tcpproxy::network::tokio::{HickoryTokioResolver, TokioConnector, TokioStreamListenerFactory};
@@ -30,6 +31,7 @@ struct Args {
     #[arg(long, default_value_t = 100)]
     max_queue: usize,
 
+    /// Writer to use for logs.
     #[arg(long, default_value_t = LogsWriter::StdErr)]
     logs_writer: LogsWriter,
 }
@@ -67,9 +69,9 @@ async fn run() -> Result<(), ProxyError> {
         TokioStreamListenerFactory,
         RoundRobinBalancer::new(
             config.clone(),
-            targets,
             HickoryTokioResolver(hickory_resolver::Resolver::builder_tokio()?.build()?),
             TokioConnector,
+            SimpleCooldownHandler::new(targets),
         ),
         config.clone(),
         cancel_token,
