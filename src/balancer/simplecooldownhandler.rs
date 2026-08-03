@@ -36,6 +36,7 @@ impl CooldownHandler for SimpleCooldownHandler {
                     cool_until: Some(Instant::now() + Self::COOLDOWN),
                 },
             )?;
+            return Ok(());
         }
         let Alive {
             cool_until: Some(until),

@@ -59,22 +59,30 @@ where
                 self.cancel_token.clone(),
             ));
         }
+        let mut first_error: Option<ProxyError> = None;
         while let Some(res) = handles.join_next().await {
             match res {
                 Ok(Ok(())) => debug!("A listener exited successfully"),
                 Ok(Err(listen_error)) => {
-                    return Err(listen_error);
+                    error!(err = %listen_error, "listener failed, shutting down remaining listeners");
+                    self.cancel_token.cancel();
+                    first_error.get_or_insert(listen_error);
                 }
                 Err(join_error) => {
-                    if join_error.is_cancelled() {
-                        return Err(ProxyError::TaskCancellation {
-                            message: join_error.to_string(),
-                        });
-                    }
+                    error!(err = %join_error, "listener task was cancelled or paniced");
+                    self.cancel_token.cancel();
+                    // Consider splitting cancellation and panic.
+                    first_error.get_or_insert(ProxyError::TaskCancellation {
+                        message: join_error.to_string(),
+                    });
                 }
             }
         }
-        Ok(())
+
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
@@ -183,7 +191,7 @@ where
         return Ok(());
     }
     error!(port, "Connection dropped, too many connections");
-    return Ok(());
+    Ok(())
 }
 
 async fn do_connection<S, B>(port: u16, mut in_sock: S, balancer: Arc<B>) -> Result<(), ProxyError>
