@@ -4,13 +4,13 @@ use tracing_subscriber::fmt::writer::BoxMakeWriter;
 
 #[derive(Clone, ValueEnum)]
 pub enum LogsWriter {
-    StdErr,
+    Stderr,
 }
 
 impl Display for LogsWriter {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         let w = match self {
-            Self::StdErr => "stderr",
+            Self::Stderr => "stderr",
         };
         f.write_str(w)
     }
@@ -19,7 +19,7 @@ impl Display for LogsWriter {
 impl LogsWriter {
     pub fn into_make_writer(self) -> BoxMakeWriter {
         match self {
-            LogsWriter::StdErr => BoxMakeWriter::new(std::io::stderr),
+            LogsWriter::Stderr => BoxMakeWriter::new(std::io::stderr),
         }
     }
 }

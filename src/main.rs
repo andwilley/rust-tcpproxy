@@ -32,7 +32,7 @@ struct Args {
     max_queue: usize,
 
     /// Writer to use for logs.
-    #[arg(long, default_value_t = LogsWriter::StdErr)]
+    #[arg(long, default_value_t = LogsWriter::Stderr)]
     logs_writer: LogsWriter,
 }
 
