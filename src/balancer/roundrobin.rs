@@ -53,10 +53,7 @@ where
     type Connector = C;
     type Cooldown = B;
 
-    async fn connect_backend(
-        &self,
-        for_port: u16,
-    ) -> Result<(<Self::Connector as StreamConnector>::Stream, SocketAddr), ProxyError> {
+    async fn connect_backend(&self, for_port: u16) -> Result<(C::Stream, SocketAddr), ProxyError> {
         let Some(backends) = &self.config.get_pool(for_port) else {
             return Err(ProxyError::TargetResolutionError {
                 port: for_port,
@@ -80,74 +77,113 @@ where
             }
         };
 
-        // TODO: Consider a fall back if all backends are cooling down, cycle though by coolest and
-        // if one succeeds reset the cooldown to now or null.
+        let mut cooling: Vec<(Instant, &str)> = Vec::new();
         for i in 0..backends.len() {
             let target = &backends[(start_idx + i) % backends.len()];
-            {
-                let target_status = self.cooldown.get_target_status(target)?;
-                match target_status {
-                    BackendStatus::Drain => continue,
-                    BackendStatus::Alive {
-                        cool_until: Some(time),
-                    } if time > Instant::now() => continue,
-                    _ => {}
+            let target_status = self.cooldown.get_target_status(target)?;
+            match target_status {
+                BackendStatus::Drain => continue,
+                BackendStatus::Alive {
+                    cool_until: Some(time),
+                } if time > Instant::now() => {
+                    cooling.push((time, target));
+                    continue;
                 }
+                _ => {}
             }
-
-            let sock_addrs = match self.resolver.lookup_host(target).await {
-                Ok(ips) => ips,
-                Err(ProxyError::DnsNxError { message }) => {
-                    let _ = self.cooldown.drain(target);
-                    error!(
-                        port = for_port,
-                        target, message, "DNS resolution failed: No IP addresses found",
-                    );
-                    continue;
-                }
-                Err(ProxyError::DnsTransientError { message }) => {
-                    let _ = self.cooldown.report_connection_attempt(target, Failure);
-                    error!(port = for_port, target, message, "DNS resolution failed");
-                    continue;
-                }
-                Err(e) => {
-                    return Err(e);
-                }
+            match self.connect(target, for_port).await {
+                ConnectAttempt::Ready(s) => return Ok(s),
+                ConnectAttempt::TryNext => continue,
+                ConnectAttempt::Fatal(e) => return Err(e),
             };
-            for sock_addr in sock_addrs {
-                let connect_timeout = Duration::from_secs(5);
-                match timeout(connect_timeout, self.connector.connect(sock_addr)).await {
-                    Ok(Ok(stream)) => {
-                        self.cooldown.report_connection_attempt(target, Success)?;
-                        return Ok((stream, sock_addr));
-                    }
-                    Ok(Err(e)) => {
-                        error!(
-                            port = for_port,
-                            target,
-                            socket_address = %sock_addr,
-                            err = %e,
-                            "failed to connect to backend/port",
-                        );
-                        continue;
-                    }
-                    Err(_) => {
-                        error!(
-                            port = for_port,
-                            target,
-                            socket_address = %sock_addr,
-                            "connection to target timed out after {:?}",
-                            connect_timeout
-                        );
-                        continue;
-                    }
-                };
-            }
-            let _ = self.cooldown.report_connection_attempt(target, Failure);
+        }
+        // Since we failed to connect, try the cooling targets.
+        cooling.sort(); // By cool_until ascending.
+        for (_, target) in cooling {
+            match self.connect(target, for_port).await {
+                ConnectAttempt::Ready(s) => return Ok(s),
+                ConnectAttempt::TryNext => continue,
+                ConnectAttempt::Fatal(e) => return Err(e),
+            };
         }
         Err(ProxyError::ConnectionError {
             port: for_port,
             message: format!("Unable to connect to any backend for port {for_port}"),
         })
+    }
+}
+
+enum ConnectAttempt<S> {
+    Ready(S),
+    TryNext,
+    Fatal(ProxyError),
+}
+
+impl<R, C, B> RoundRobinBalancer<R, C, B>
+where
+    R: Resolver,
+    C: StreamConnector,
+    B: CooldownHandler,
+{
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+    async fn connect(
+        &self,
+        target: &str,
+        for_port: u16,
+    ) -> ConnectAttempt<(C::Stream, SocketAddr)> {
+        let sock_addrs = match self.resolver.lookup_host(target).await {
+            Ok(ips) => ips,
+            Err(ProxyError::DnsNxError { message }) => {
+                let _ = self.cooldown.drain(target);
+                error!(
+                    port = for_port,
+                    target, message, "DNS resolution failed: No IP addresses found",
+                );
+                return ConnectAttempt::TryNext;
+            }
+            Err(ProxyError::DnsTransientError { message }) => {
+                let _ = self.cooldown.report_connection_attempt(target, Failure);
+                error!(port = for_port, target, message, "DNS resolution failed");
+                return ConnectAttempt::TryNext;
+            }
+            Err(e) => {
+                return ConnectAttempt::Fatal(e);
+            }
+        };
+
+        for sock_addr in sock_addrs {
+            match timeout(Self::CONNECT_TIMEOUT, self.connector.connect(sock_addr)).await {
+                Ok(Ok(stream)) => {
+                    match self.cooldown.report_connection_attempt(target, Success) {
+                        Ok(_) => {}
+                        Err(e) => return ConnectAttempt::Fatal(e),
+                    };
+                    return ConnectAttempt::Ready((stream, sock_addr));
+                }
+                Ok(Err(e)) => {
+                    error!(
+                        port = for_port,
+                        target,
+                        socket_address = %sock_addr,
+                        err = %e,
+                        "failed to connect to backend/port",
+                    );
+                    continue;
+                }
+                Err(_) => {
+                    error!(
+                        port = for_port,
+                        target,
+                        socket_address = %sock_addr,
+                        "connection to target timed out after {:?}",
+                        Self::CONNECT_TIMEOUT
+                    );
+                    continue;
+                }
+            };
+        }
+        let _ = self.cooldown.report_connection_attempt(target, Failure);
+        ConnectAttempt::TryNext
     }
 }

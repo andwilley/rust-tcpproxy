@@ -6,16 +6,21 @@ use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[derive(Debug)]
 pub struct ProxyConfig {
     target_pools: Vec<Vec<String>>,
     port_to_pool: HashMap<u16, usize>,
 }
 
+#[derive(Debug)]
 pub struct TargetState {
     target_status: HashMap<String, ArcSwap<BackendStatus>>,
 }
 
-#[derive(Clone, Copy)]
+/// The status of a backend. Up if Alive where cool_until is None or some instant in the past.
+/// Cooling if cool_until is in the future. Down if Drain.
+/// Note: sorting correctly depends on the order these values are defined in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BackendStatus {
     Alive { cool_until: Option<Instant> },
     Drain,

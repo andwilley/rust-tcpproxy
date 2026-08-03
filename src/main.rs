@@ -26,8 +26,8 @@ struct Args {
     #[arg(long, default_value_t = 10000)]
     max_connections: usize,
 
-    /// Maximum number of queued connections to allow (not to be confused with the maximum dynamic
-    /// pressure and aerodynamic stress on the proxy).
+    /// Maximum number of queued connections to allow before we start outright rejecting (not to be
+    /// confused with the maximum dynamic pressure and aerodynamic stress on the proxy).
     #[arg(long, default_value_t = 100)]
     max_queue: usize,
 
