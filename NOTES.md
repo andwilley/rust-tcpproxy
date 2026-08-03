@@ -78,3 +78,9 @@ The enum was designed to need minimal updates and we expect backend failures to 
 * all backends fail to connect at the same time
 * DNS outage
 * malicous clients (slow loris, etc)
+
+## Draining is permanent for now
+
+## Cooldown handling is intentionally loose
+
+We don't require that we get 100% consistency. The cooldown state of a backend can be stepped on by another attempt that had success, e.g. This is generally fine here. Handling that would require much more concurrency control, more blocking and contention, etc. If one task could connect and the other couldn't, they're probably both basically right.

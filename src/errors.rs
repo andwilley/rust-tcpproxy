@@ -35,7 +35,7 @@ pub enum ProxyError {
     #[error("Transient DNS error: {message}")]
     DnsTransientError { message: String },
 
-    #[error("Transient DNS error: {message}")]
+    #[error("Permanent DNS error: {message}")]
     DnsNxError { message: String },
 }
 

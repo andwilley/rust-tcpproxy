@@ -17,9 +17,7 @@ pub struct TargetState {
 
 #[derive(Clone, Copy)]
 pub enum BackendStatus {
-    Alive {
-        cool_until: Option<Instant>,
-    },
+    Alive { cool_until: Option<Instant> },
     Drain,
 }
 
