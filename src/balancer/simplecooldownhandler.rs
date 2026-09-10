@@ -8,6 +8,7 @@ use crate::state::{BackendStatus, BackendStatus::Alive, BackendStatus::Drain, Ta
 pub struct SimpleCooldownHandler {
     targets: TargetState,
 }
+
 impl SimpleCooldownHandler {
     const COOLDOWN: Duration = Duration::from_secs(120);
 
@@ -15,6 +16,7 @@ impl SimpleCooldownHandler {
         SimpleCooldownHandler { targets }
     }
 }
+
 impl CooldownHandler for SimpleCooldownHandler {
     fn get_target_status(&self, target: &str) -> Result<BackendStatus, ProxyError> {
         let status = **self.targets.get_target_status(target)?;

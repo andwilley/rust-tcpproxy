@@ -12,6 +12,7 @@ pub struct ProxyConfig {
     port_to_pool: HashMap<u16, usize>,
 }
 
+/// TODO: This should not expose ArcSwap internals
 #[derive(Debug)]
 pub struct TargetState {
     target_status: HashMap<String, ArcSwap<BackendStatus>>,
@@ -26,6 +27,7 @@ pub enum BackendStatus {
     Drain,
 }
 
+/// TODO: This should not expose ArcSwap internals
 impl TargetState {
     pub fn get_target_status(&self, target: &str) -> Result<Guard<Arc<BackendStatus>>, ProxyError> {
         self.target_status

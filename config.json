@@ -9,8 +9,8 @@
         5400
       ],
       "Targets": [
-        "tcp-echo.fly.dev:5001",
-        "tcp-echo.fly.dev:5002"
+        "good.example.com:5001",
+        "good.example.com:5002"
       ]
     },
     {
@@ -22,9 +22,9 @@
         6400
       ],
       "Targets": [
-        "tcp-echo.fly.dev:6001",
-        "tcp-echo.fly.dev:6002",
-        "bad.target.for.testing:6003"
+        "good.example.com:6001",
+        "good.example.com:6002",
+        "bad.example.com:6003"
       ]
     },
     {
@@ -36,8 +36,8 @@
         7400
       ],
       "Targets": [
-        "tcp-echo.fly.dev:7001",
-        "tcp-echo.fly.dev:7002"
+        "good.example.com:7001",
+        "good.example.com:7002"
       ]
     }
   ]

@@ -16,7 +16,16 @@ use std::sync::Arc;
 use tcpproxy::{config::RawConfig, proxy, state::ProxyConfig};
 
 #[derive(Parser)]
-#[command(version, about = "A simple TCP Proxy", long_about = None)]
+#[command(version, about = "A simple TCP Proxy", long_about = "
+A simple TCP proxy. Not intended for reuse.
+
+Config.json must be updated with valid/test backends. The general structure is:
+
+- A top-level list of Apps
+- Each App defines the set of ports it will listen on.
+- And a set of backend targets for the proxy to forward this traffic.
+- Ports cannot be reused, but backends may apply to more than one App.
+")]
 struct Args {
     /// Configuration file for this proxy instance
     #[arg(long)]
