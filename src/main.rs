@@ -10,13 +10,17 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use clap::Parser;
+use std::net::{IpAddr, Ipv6Addr};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use tcpproxy::{config::RawConfig, proxy, state::ProxyConfig};
 
 #[derive(Parser)]
-#[command(version, about = "A simple TCP Proxy", long_about = "
+#[command(
+    version,
+    about = "A simple TCP Proxy",
+    long_about = "
 A simple TCP proxy. Not intended for reuse.
 
 Config.json must be updated with valid/test backends. The general structure is:
@@ -25,7 +29,8 @@ Config.json must be updated with valid/test backends. The general structure is:
 - Each App defines the set of ports it will listen on.
 - And a set of backend targets for the proxy to forward this traffic.
 - Ports cannot be reused, but backends may apply to more than one App.
-")]
+"
+)]
 struct Args {
     /// Configuration file for this proxy instance
     #[arg(long)]
@@ -43,6 +48,10 @@ struct Args {
     /// Writer to use for logs.
     #[arg(long, default_value_t = LogsWriter::Stderr)]
     logs_writer: LogsWriter,
+
+    /// Local address to bind.
+    #[arg(long, default_value_t = IpAddr::V6(Ipv6Addr::UNSPECIFIED))]
+    bind: IpAddr,
 }
 
 async fn shutdown_signal(cancel_token: CancellationToken) {
@@ -86,6 +95,7 @@ async fn run() -> Result<(), ProxyError> {
         cancel_token,
         args.max_connections,
         args.max_queue,
+        args.bind,
     )
     .run()
     .await?;

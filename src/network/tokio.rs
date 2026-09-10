@@ -1,4 +1,5 @@
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use tracing::debug;
 
 use crate::{
     errors::ProxyError,
@@ -10,7 +11,7 @@ use std::net::SocketAddr;
 pub struct TokioStreamListenerFactory;
 impl StreamListenerFactory for TokioStreamListenerFactory {
     type Listener = TokioListener;
-    async fn bind(&self, addr: &str) -> Result<Self::Listener, ProxyError> {
+    async fn bind(&self, addr: &SocketAddr) -> Result<Self::Listener, ProxyError> {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         Ok(TokioListener(listener))
     }
@@ -21,7 +22,9 @@ impl StreamListener for TokioListener {
     type Stream = tokio::net::TcpStream;
     async fn accept(&self) -> Result<(Self::Stream, SocketAddr), ProxyError> {
         let (stream, addr) = self.0.accept().await?;
-        stream.set_nodelay(true)?;
+        if let Err(e) = stream.set_nodelay(true) {
+            debug!(peer = %addr, err = %e, "set_nodelay failed");
+        }
         Ok((stream, addr))
     }
 }
@@ -30,6 +33,10 @@ impl StreamListener for TokioListener {
 pub struct HickoryTokioResolver(pub hickory_resolver::Resolver<TokioRuntimeProvider>);
 impl Resolver for HickoryTokioResolver {
     async fn lookup_host(&self, host: &str) -> Result<Vec<SocketAddr>, ProxyError> {
+        // Make sure its not already an IP.
+        if let Ok(addr) = host.parse::<SocketAddr>() {
+            return Ok(vec![addr]);
+        }
         let Some((hostname, port_string)) = host.split_once(":") else {
             return Err(ProxyError::BadAddressError {
                 addr: host.to_string(),

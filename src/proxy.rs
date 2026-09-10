@@ -2,10 +2,8 @@ use crate::balancer::traits::LoadBalancer;
 use crate::errors::ProxyError;
 use crate::network::traits::{AsyncStream, StreamListener, StreamListenerFactory};
 use crate::state::ProxyConfig;
-use std::io::ErrorKind::{
-    AddrInUse, AddrNotAvailable, InvalidData, InvalidInput, PermissionDenied,
-};
-use std::net::SocketAddr;
+use std::io::ErrorKind::InvalidInput;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::select;
@@ -22,6 +20,7 @@ pub struct ProxyServer<L, B> {
     cancel_token: CancellationToken,
     open_connections: Arc<Semaphore>,
     queued_connections: Arc<Semaphore>,
+    bind_addr: IpAddr,
 }
 
 impl<L, B> ProxyServer<L, B>
@@ -36,6 +35,7 @@ where
         cancel_token: CancellationToken,
         max_connections: usize,
         max_queue: usize,
+        bind_addr: IpAddr,
     ) -> Self {
         Self {
             listener_factory,
@@ -44,6 +44,7 @@ where
             cancel_token,
             open_connections: Arc::new(Semaphore::const_new(max_connections)),
             queued_connections: Arc::new(Semaphore::const_new(max_queue)),
+            bind_addr,
         }
     }
 
@@ -57,6 +58,7 @@ where
                 self.open_connections.clone(),
                 self.queued_connections.clone(),
                 self.cancel_token.clone(),
+                self.bind_addr,
             ));
         }
         let mut first_error: Option<ProxyError> = None;
@@ -93,15 +95,23 @@ async fn listen<L, B>(
     open_connections: Arc<Semaphore>,
     queued_connections: Arc<Semaphore>,
     cancel_token: CancellationToken,
+    bind_addr: IpAddr,
 ) -> Result<(), ProxyError>
 where
     L: StreamListenerFactory + 'static,
     B: LoadBalancer + 'static,
 {
-    let listener = listener_factory.bind(&format!("[::]:{port}")).await?;
+    let listener = listener_factory
+        .bind(&SocketAddr::new(bind_addr, port))
+        .await?;
     let mut connections = JoinSet::new();
 
     loop {
+        while let Some(res) = connections.try_join_next() {
+            if let Err(e) = res {
+                error!(port, err = %e, "connection task panicked");
+            }
+        }
         select! {
             accept_result = listener.accept() => {
                 let Err(e) = accept_connection(
@@ -121,6 +131,9 @@ where
             }
         }
     }
+
+    // Stop accepting connections while we shut down.
+    drop(listener);
 
     info!(port, "Shutting down, attempting to drain open connections.");
     select! {
@@ -152,10 +165,7 @@ where
         Err(e) => {
             if let ProxyError::IoError(ref io_err) = e {
                 let kind = io_err.kind();
-                if matches!(
-                    kind,
-                    InvalidInput | InvalidData | PermissionDenied | AddrInUse | AddrNotAvailable
-                ) {
+                if kind == InvalidInput {
                     error!(port, err = %e, "fatal error on accept");
                     return Err(e);
                 }

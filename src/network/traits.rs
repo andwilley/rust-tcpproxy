@@ -8,7 +8,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncStream for T {}
 
 pub trait StreamListenerFactory: Send + Sync + Clone {
     type Listener: StreamListener;
-    fn bind(&self, addr: &str) -> impl Future<Output = Result<Self::Listener, ProxyError>> + Send;
+    fn bind(
+        &self,
+        addr: &SocketAddr,
+    ) -> impl Future<Output = Result<Self::Listener, ProxyError>> + Send;
 }
 
 pub trait StreamListener: Send + Sync {

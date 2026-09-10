@@ -12,7 +12,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::time::timeout;
-use tracing::error;
+use tracing::{error, warn};
 
 pub struct RoundRobinBalancer<R, C, B> {
     config: Arc<ProxyConfig>,
@@ -135,8 +135,8 @@ where
         let sock_addrs = match self.resolver.lookup_host(target).await {
             Ok(ips) => ips,
             Err(ProxyError::DnsNxError { message }) => {
-                let _ = self.cooldown.drain(target);
-                error!(
+                let _ = self.cooldown.report_connection_attempt(target, Failure);
+                warn!(
                     port = for_port,
                     target, message, "DNS resolution failed: No IP addresses found",
                 );
@@ -162,7 +162,7 @@ where
                     return ConnectAttempt::Ready((stream, sock_addr));
                 }
                 Ok(Err(e)) => {
-                    error!(
+                    warn!(
                         port = for_port,
                         target,
                         socket_address = %sock_addr,
