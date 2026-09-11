@@ -7,40 +7,6 @@ A project designed to learn async Rust. Not intended for reuse.
 cargo run -- --help
 ```
 
-TODO
-----
-
--	Testing
-	-	Mock traits for testing
-	-	Unit tests
-	-	Manual end-to-end test with fake backends
-	-	Load tests, performance benchmarks
--   Validate config targets on load
--	Documentation comments throughout
--	Metrics/telemetry
--	Check file descriptor limits
--	Remove ArcSwap types from public APIs (TargetState)
--	Improve the configuration structure
--	Configurable queue wait time
--	Configurable copy buffer sizes
-	-	8 KB default buffer size for `copy_bidirectional` not configurable
-	-	My solution would have to handle backpressure as well (sender fast than receiver e.g.)
--	Pathological cases
-	-	All backends fail to connect at the same time
-	-	DNS outage
-	-	Malicious clients (slow loris, retry storm, etc)
--	Configurable overall connection timeout
-
-Future features
----------------
-
--	Dynamic backend discovery
-	-	On demand backend drain/undrain
-	-	Change backend mapping
-	-	Would have to support draining now unmapped backends and undraining new ones
--	Denylist for IPs or ranges
--	Background DNS resolution
-
 Design decisions
 ----------------
 
@@ -79,3 +45,37 @@ I wanted to avoid `async-trait` mostly to learn using the newer native support f
 ### Drain is unused.
 
 Most of the failures we handle can be impermanent so a full drain is too heavy handed. Drain is reserved for use in dynamically draining backends, which is unimplemented. We could be smarter about how we cool down, varying cooldowns based on the error, and tracking continuous failures.
+
+TODO
+----
+
+-	Next: Testing
+	-	Mock traits for testing
+	-	Unit tests
+	-	Manual end-to-end test with fake backends
+	-	Load tests, performance benchmarks
+-	Validate config targets on load
+-	Documentation comments throughout
+-	Metrics/telemetry
+-	Check file descriptor limits
+-	Remove ArcSwap types from public APIs (TargetState)
+-	Improve the configuration structure
+-	Configurable queue wait time
+-	Configurable copy buffer sizes
+	-	8 KB default buffer size for `copy_bidirectional` not configurable
+	-	My solution would have to handle backpressure as well (sender fast than receiver e.g.)
+-	Pathological cases
+	-	All backends fail to connect at the same time
+	-	DNS outage
+	-	Malicious clients (slow loris, retry storm, etc)
+-	Configurable overall connection timeout
+
+Future features
+---------------
+
+-	Dynamic backend discovery
+	-	On demand backend drain/undrain
+	-	Change backend mapping
+	-	Would have to support draining now unmapped backends and undraining new ones
+-	Denylist for IPs or ranges
+-	Background DNS resolution
