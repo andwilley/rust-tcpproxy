@@ -42,9 +42,9 @@ We don't require that we get 100% consistency. The cooldown state of a backend c
 
 I wanted to avoid `async-trait` mostly to learn using the newer native support for async functions in traits. This proxy doesn't have a need yet for anything other than statically defined types and trait implementations. There are some performance benefits as well, but I suspect they aren't significant.
 
-### Drain is unused.
+### Drain is unused
 
-Most of the failures we handle can be impermanent so a full drain is too heavy handed. Drain is reserved for use in dynamically draining backends, which is unimplemented. We could be smarter about how we cool down, varying cooldowns based on the error, and tracking continuous failures.
+Most of the failures we handle can be transient, even NXDOMAIN, so a full drain is too heavy handed. Drain is reserved for use in user drains/undrains, which is unimplemented. We could be smarter about how we cool down, varying cooldowns based on the error, and tracking continuous failures.
 
 TODO
 ----
