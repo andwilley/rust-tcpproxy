@@ -163,7 +163,7 @@ where
     let (in_sock, _source_addr) = match accept_result {
         Ok(res) => res,
         Err(e) => {
-            if let ProxyError::IoError(ref io_err) = e {
+            if let ProxyError::IoError(io_err) = &e {
                 let kind = io_err.kind();
                 if kind == InvalidInput {
                     error!(port, err = %e, "fatal error on accept");

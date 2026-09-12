@@ -16,7 +16,7 @@ This is simple and quick to get started with. The config shape is adapted from t
 
 ### DNS resolution
 
-We use hickory rather than OS DNS resolution. This gets us caching, but misses still result in synchronous lookups. Background lookups could improve performance as long as it doesn't compete with connections. A task to refresh resolution at TTLs could be first step.
+We use hickory rather than OS DNS resolution. This gets us caching, but misses still result in lookups during connection. Background lookups could improve performance as long as it doesn't compete with connections. A task to refresh resolution at TTLs could be first step.
 
 ### Backpressure
 
@@ -28,11 +28,11 @@ We need some way to keep track of backend state. This will be checked for every 
 
 The data model was designed to support this "minimal mutation required" approach. We have a 2 value enum to represent 3 states. A backend is either serving traffic, cooling down, or drained. To represent cooldown we use a simple `Instant`, where if that is in the future, the backend is still cooling down. Once this cooldown expires it doesn't need to be updated. There are cases where we'll try to connect to cooling backends and if successful, we do remove the cooldown, but typically this shouldn't be necessary. This should make an assumption that we are almost always reading and very rarely writing a valid one.
 
-A mutex per backend would be safe, but pays a context switching tax, as does reader/writer locks. Even though critical sections are short, both serve to put a kind of ceiling on concurrency which can be roughly translated to throughput of the proxy.
+A mutex per backend would be safe, but would increase contention for reads, and rwlocks typically don't fare much better. Even though critical sections are short, both serve to put a kind of ceiling on concurrency which can be roughly translated to throughput of the proxy.
 
 Lock-free with atomics is an option, but would require losing some information by being a bit creative with integer types.
 
-ArcSwap allows us to optimize for the read path without dealing with the cache bounce penalty for rwlocks or mutexes. The obvious downside is that if many backends start failing, performance suffers a bit as writes to the target state map will be more common. In a situation like that though, it's probable that the penalty for writing / swapping heap refs is overshadowed by the latency of failing backends.
+ArcSwap allows us to optimize for the read path without dealing with the cache bounce penalty for rwlocks or mutexes. The obvious downside is that if many backends start failing, performance suffers a bit as writes to the target state map will be more common and each new one requires a new heap allocation. In a situation like that though, it's probable that the penalty for writing / swapping heap refs is overshadowed by the latency of failing backends.
 
 ### Cooldown handling is intentionally loose
 
@@ -50,7 +50,7 @@ TODO
 ----
 
 -	Next: Testing
-	-	Mock traits for testing
+	-	Mock traits for testing [in progress]
 	-	Unit tests
 	-	Manual end-to-end test with fake backends
 	-	Load tests, performance benchmarks

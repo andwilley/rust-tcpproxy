@@ -1,20 +1,16 @@
 use crate::errors::ProxyError;
-use crate::network::traits::{Resolver, StreamConnector};
+use crate::network::traits::AsyncStream;
 use crate::state::BackendStatus;
 use std::future::Future;
 use std::net::SocketAddr;
 
 pub trait LoadBalancer: Send + Sync + 'static {
-    type Resolver: Resolver;
-    type Connector: StreamConnector;
-    type Cooldown: CooldownHandler;
+    type Stream: AsyncStream;
 
     fn connect_backend(
         &self,
         for_port: u16,
-    ) -> impl Future<
-        Output = Result<(<Self::Connector as StreamConnector>::Stream, SocketAddr), ProxyError>,
-    > + Send;
+    ) -> impl Future<Output = Result<(Self::Stream, SocketAddr), ProxyError>> + Send;
 }
 
 #[derive(PartialEq)]

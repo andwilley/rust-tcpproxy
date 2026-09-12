@@ -49,9 +49,7 @@ where
     C: StreamConnector,
     B: CooldownHandler,
 {
-    type Resolver = R;
-    type Connector = C;
-    type Cooldown = B;
+    type Stream = C::Stream;
 
     async fn connect_backend(&self, for_port: u16) -> Result<(C::Stream, SocketAddr), ProxyError> {
         let Some(backends) = &self.config.get_pool(for_port) else {
@@ -97,6 +95,7 @@ where
                 ConnectAttempt::Fatal(e) => return Err(e),
             };
         }
+
         // Since we failed to connect, try the cooling targets.
         cooling.sort(); // By cool_until ascending.
         for (_, target) in cooling {
