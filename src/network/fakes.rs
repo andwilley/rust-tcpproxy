@@ -12,15 +12,26 @@ use std::{
 
 // TODO Documention on how to use this fake with examples.
 
+pub enum ClientConnectionSpec {
+    /// Repeats this connection a specified number of times. Zero is allowed and will result in a
+    /// port that will bind but never yeild a connection.
+    Connect {
+        count: usize,
+    },
+    Fail(ProxyError),
+}
+
 #[derive(Clone)]
 pub struct FakeListenerFactory {
     port_behaviors: Arc<Mutex<HashMap<u16, BindBehavior>>>,
 }
+
 impl FakeListenerFactory {
     pub fn builder() -> FakeListenerFactoryBuilder {
         FakeListenerFactoryBuilder::default()
     }
 }
+
 impl StreamListenerFactory for FakeListenerFactory {
     type Listener = FakeListener;
     async fn bind(&self, addr: &SocketAddr) -> Result<Self::Listener, ProxyError> {
@@ -35,27 +46,24 @@ impl StreamListenerFactory for FakeListenerFactory {
     }
 }
 
-pub enum BindBehavior {
+enum BindBehavior {
     Bind(FakeListener),
     Fail(ProxyError),
 }
 
-pub enum ConnectionSpec {
-    /// Repeats this connection a specified number of times. Zero is allowed and will result in a
-    /// port that will bind but never yeild a connection.
-    Connect {
-        count: usize,
-    },
-    Fail(ProxyError),
-}
-
-pub enum ConnectionResult {
+enum ClientConnectionResult {
     Connect((DuplexStream, SocketAddr)),
     Fail(ProxyError),
 }
 
+/// The test stub for each upstream connection the test attempted to create per the spec.
+enum ClientConnectionStub {
+    Connect(DuplexStream),
+    Fail,
+}
+
 pub struct FakeListenerFactoryBuilder {
-    ports: Vec<(u16, Vec<ConnectionSpec>)>,
+    ports: Vec<(u16, Vec<ClientConnectionSpec>)>,
     failed_ports: Vec<(u16, ProxyError)>,
     /// Defaults to 64 KiB
     duplex_buf: usize,
@@ -75,7 +83,7 @@ impl FakeListenerFactoryBuilder {
     pub fn add_port_connections(
         mut self,
         port: u16,
-        client_connections: Vec<ConnectionSpec>,
+        client_connections: Vec<ClientConnectionSpec>,
     ) -> Self {
         self.ports.push((port, client_connections));
         self
@@ -92,52 +100,69 @@ impl FakeListenerFactoryBuilder {
         self
     }
 
-    pub fn build(self) -> (FakeListenerFactory, HashMap<u16, Vec<DuplexStream>>) {
+    /// Build the configured listener factory. Also returns the client-sides for each attempted
+    /// connection in order of connection.
+    pub fn build(
+        self,
+    ) -> (
+        FakeListenerFactory,
+        HashMap<u16, Vec<ClientConnectionStub>>,
+    ) {
         let mut behaviors: HashMap<u16, BindBehavior> = HashMap::new();
-        let mut client_streams: HashMap<u16, Vec<DuplexStream>> = HashMap::new();
+        let mut test_sides: HashMap<u16, Vec<ClientConnectionStub>> = HashMap::new();
         let mut source_ctr = 0usize;
 
         for (port, specs) in self.ports {
             let mut sequence = VecDeque::new();
             for spec in specs {
                 match spec {
-                    ConnectionSpec::Connect { count } => {
+                    ClientConnectionSpec::Connect { count } => {
                         for _ in 0..count {
                             let (proxy_side, test_side) = duplex(self.duplex_buf);
                             let source: SocketAddr = format!("127.0.0.1:{}", 40000 + source_ctr)
                                 .parse()
                                 .expect("valid source address");
                             source_ctr += 1;
-                            client_streams.entry(port).or_default().push(test_side);
-                            sequence.push_back(ConnectionResult::Connect((proxy_side, source)));
+                            test_sides
+                                .entry(port)
+                                .or_default()
+                                .push(ClientConnectionStub::Connect(test_side));
+                            sequence
+                                .push_back(ClientConnectionResult::Connect((proxy_side, source)));
                         }
                     }
-                    ConnectionSpec::Fail(e) => {
-                        sequence.push_back(ConnectionResult::Fail(e));
+                    ClientConnectionSpec::Fail(e) => {
+                        test_sides
+                            .entry(port)
+                            .or_default()
+                            .push(ClientConnectionStub::Fail);
+                        sequence.push_back(ClientConnectionResult::Fail(e));
                     }
                 }
             }
             // build the behavior for the port
             behaviors.insert(port, BindBehavior::Bind(FakeListener::new(sequence)));
         }
+
         for (port, proxy_error) in self.failed_ports {
             behaviors.insert(port, BindBehavior::Fail(proxy_error));
         }
+
         (
             FakeListenerFactory {
                 port_behaviors: Arc::new(Mutex::new(behaviors)),
             },
-            client_streams,
+            test_sides,
         )
     }
 }
 
 pub struct FakeListener {
-    connections: Mutex<VecDeque<ConnectionResult>>,
+    connections: Mutex<VecDeque<ClientConnectionResult>>,
 }
 
 impl FakeListener {
-    fn new(connections: VecDeque<ConnectionResult>) -> Self {
+    fn new(connections: VecDeque<ClientConnectionResult>) -> Self {
         Self {
             connections: Mutex::new(connections),
         }
@@ -149,8 +174,8 @@ impl StreamListener for FakeListener {
     async fn accept(&self) -> Result<(Self::Stream, SocketAddr), ProxyError> {
         let next = self.connections.lock().unwrap().pop_front();
         match next {
-            Some(ConnectionResult::Connect((stream, source))) => Ok((stream, source)),
-            Some(ConnectionResult::Fail(e)) => Err(e),
+            Some(ClientConnectionResult::Connect((stream, source))) => Ok((stream, source)),
+            Some(ClientConnectionResult::Fail(e)) => Err(e),
             None => std::future::pending().await,
         }
     }

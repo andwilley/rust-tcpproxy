@@ -6,7 +6,7 @@ use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::time::Instant;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ProxyConfig {
     target_pools: Vec<Vec<String>>,
     port_to_pool: HashMap<u16, usize>,
