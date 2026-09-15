@@ -1,5 +1,3 @@
-use tokio::io::{DuplexStream, duplex};
-
 use crate::{
     errors::ProxyError,
     network::traits::{StreamListener, StreamListenerFactory},
@@ -9,6 +7,7 @@ use std::{
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
+use tokio::io::{DuplexStream, duplex};
 
 // TODO Documention on how to use this fake with examples.
 
@@ -28,7 +27,11 @@ pub struct FakeListenerFactory {
 
 impl FakeListenerFactory {
     pub fn builder() -> FakeListenerFactoryBuilder {
-        FakeListenerFactoryBuilder::default()
+        FakeListenerFactoryBuilder {
+            ports: Vec::new(),
+            failed_ports: Vec::new(),
+            duplex_buf: 1024 * 64,
+        }
     }
 }
 
@@ -40,7 +43,10 @@ impl StreamListenerFactory for FakeListenerFactory {
                 BindBehavior::Bind(listener) => listener,
                 BindBehavior::Fail(e) => return Err(e),
             },
-            None => panic!("Attempted to bind a port with no defined behavior"),
+            None => panic!(
+                "Attempted to bind port {} with no defined behavior",
+                addr.port()
+            ),
         };
         Ok(listener)
     }
@@ -57,7 +63,7 @@ enum ClientConnectionResult {
 }
 
 /// The test stub for each upstream connection the test attempted to create per the spec.
-enum ClientConnectionStub {
+pub enum ClientConnectionStub {
     Connect(DuplexStream),
     Fail,
 }
@@ -67,16 +73,6 @@ pub struct FakeListenerFactoryBuilder {
     failed_ports: Vec<(u16, ProxyError)>,
     /// Defaults to 64 KiB
     duplex_buf: usize,
-}
-
-impl Default for FakeListenerFactoryBuilder {
-    fn default() -> Self {
-        FakeListenerFactoryBuilder {
-            ports: Vec::new(),
-            failed_ports: Vec::new(),
-            duplex_buf: 1024 * 64,
-        }
-    }
 }
 
 impl FakeListenerFactoryBuilder {
@@ -102,12 +98,7 @@ impl FakeListenerFactoryBuilder {
 
     /// Build the configured listener factory. Also returns the client-sides for each attempted
     /// connection in order of connection.
-    pub fn build(
-        self,
-    ) -> (
-        FakeListenerFactory,
-        HashMap<u16, Vec<ClientConnectionStub>>,
-    ) {
+    pub fn build(self) -> (FakeListenerFactory, HashMap<u16, Vec<ClientConnectionStub>>) {
         let mut behaviors: HashMap<u16, BindBehavior> = HashMap::new();
         let mut test_sides: HashMap<u16, Vec<ClientConnectionStub>> = HashMap::new();
         let mut source_ctr = 0usize;

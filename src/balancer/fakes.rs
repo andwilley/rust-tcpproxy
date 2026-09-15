@@ -1,16 +1,10 @@
-use tokio::io::{DuplexStream, duplex};
-
 use crate::balancer::traits::LoadBalancer;
 use crate::errors::ProxyError;
 use crate::state::ProxyConfig;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::Mutex;
-
-pub enum BackendConnectionResult {
-    Connect((DuplexStream, SocketAddr)),
-    Fail(ProxyError),
-}
+use std::sync::{Arc, Mutex};
+use tokio::io::{DuplexStream, duplex};
 
 pub enum BackendConnectionStub {
     Connect(DuplexStream),
@@ -23,20 +17,15 @@ pub enum BackendConnectionSpec {
 }
 
 pub struct FakeLoadBalancerBuilder {
-    config: ProxyConfig,
+    config: Arc<ProxyConfig>,
     ports: Vec<(u16, Vec<BackendConnectionSpec>)>,
     /// Defaults to 64 KiB
     duplex_buf: usize,
 }
 
-impl Default for FakeLoadBalancerBuilder {
-    fn default() -> Self {
-        FakeLoadBalancerBuilder {
-            config: ProxyConfig::default(),
-            ports: Vec::new(),
-            duplex_buf: 1024 * 64,
-        }
-    }
+enum BackendConnectionResult {
+    Connect((DuplexStream, SocketAddr)),
+    Fail(ProxyError),
 }
 
 impl FakeLoadBalancerBuilder {
@@ -57,19 +46,23 @@ impl FakeLoadBalancerBuilder {
     /// Build the configured balancer. Also returns the downstream-sides for each attempted
     /// connection in order of connection.
     pub fn build(self) -> (FakeLoadBalancer, HashMap<u16, Vec<BackendConnectionStub>>) {
+        let ports: HashSet<u16> = self.config.ports().collect();
         let mut port_connections: HashMap<u16, Mutex<VecDeque<BackendConnectionResult>>> =
             HashMap::new();
         let mut test_sides: HashMap<u16, Vec<BackendConnectionStub>> = HashMap::new();
         let mut source_ctr = 0usize;
 
         for (port, specs) in self.ports {
+            if !ports.contains(&port) {
+                panic!("Attempt to configure test behavior for an unbound port");
+            }
             let mut sequence = VecDeque::new();
             for spec in specs {
                 match spec {
                     BackendConnectionSpec::Connect { count } => {
                         for _ in 0..count {
                             let (proxy_side, test_side) = duplex(self.duplex_buf);
-                            let source: SocketAddr = format!("127.0.0.1:{}", 40000 + source_ctr)
+                            let source: SocketAddr = format!("127.0.0.1:{}", 9000 + source_ctr)
                                 .parse()
                                 .expect("valid source address");
                             source_ctr += 1;
@@ -94,18 +87,24 @@ impl FakeLoadBalancerBuilder {
             port_connections.insert(port, Mutex::new(sequence));
         }
 
-        (
-            FakeLoadBalancer {
-                port_connections: port_connections,
-            },
-            test_sides,
-        )
+        (FakeLoadBalancer { port_connections }, test_sides)
     }
 }
 
 pub struct FakeLoadBalancer {
     port_connections: HashMap<u16, Mutex<VecDeque<BackendConnectionResult>>>,
 }
+
+impl FakeLoadBalancer {
+    pub fn builder(config: Arc<ProxyConfig>) -> FakeLoadBalancerBuilder {
+        FakeLoadBalancerBuilder {
+            config,
+            ports: Vec::new(),
+            duplex_buf: 1024 * 64,
+        }
+    }
+}
+
 impl LoadBalancer for FakeLoadBalancer {
     type Stream = DuplexStream;
 
