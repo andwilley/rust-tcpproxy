@@ -50,7 +50,7 @@ impl FakeLoadBalancerBuilder {
         let mut port_connections: HashMap<u16, Mutex<VecDeque<BackendConnectionResult>>> =
             HashMap::new();
         let mut test_sides: HashMap<u16, Vec<BackendConnectionStub>> = HashMap::new();
-        let mut source_ctr = 0usize;
+        let mut downstream_ctr = 0usize;
 
         for (port, specs) in self.ports {
             if !ports.contains(&port) {
@@ -62,16 +62,18 @@ impl FakeLoadBalancerBuilder {
                     BackendConnectionSpec::Connect { count } => {
                         for _ in 0..count {
                             let (proxy_side, test_side) = duplex(self.duplex_buf);
-                            let source: SocketAddr = format!("127.0.0.1:{}", 9000 + source_ctr)
-                                .parse()
-                                .expect("valid source address");
-                            source_ctr += 1;
+                            let downstream: SocketAddr =
+                                format!("127.0.0.1:{}", 9000 + downstream_ctr)
+                                    .parse()
+                                    .expect("valid downstream address");
+                            downstream_ctr += 1;
                             test_sides
                                 .entry(port)
                                 .or_default()
                                 .push(BackendConnectionStub::Connect(test_side));
-                            sequence
-                                .push_back(BackendConnectionResult::Connect((proxy_side, source)));
+                            sequence.push_back(BackendConnectionResult::Connect((
+                                proxy_side, downstream,
+                            )));
                         }
                     }
                     BackendConnectionSpec::Fail(e) => {
