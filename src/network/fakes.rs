@@ -9,11 +9,11 @@ use std::{
 };
 use tokio::io::{DuplexStream, duplex};
 
-// TODO Documention on how to use this fake with examples.
+// TODO: Documentation on how to use this fake with examples.
 
 pub enum ClientConnectionSpec {
     /// Repeats this connection a specified number of times. Zero is allowed and will result in a
-    /// port that will bind but never yeild a connection.
+    /// port that will bind but never yield a connection.
     Connect {
         count: usize,
     },
@@ -71,7 +71,6 @@ pub enum ClientConnectionStub {
 pub struct FakeListenerFactoryBuilder {
     ports: Vec<(u16, Vec<ClientConnectionSpec>)>,
     failed_ports: Vec<(u16, ProxyError)>,
-    /// Defaults to 64 KiB
     duplex_buf: usize,
 }
 
@@ -91,6 +90,7 @@ impl FakeListenerFactoryBuilder {
         self
     }
 
+    /// Defaults to 64 KiB
     pub fn set_duplex_buffer(mut self, size: usize) -> Self {
         self.duplex_buf = size;
         self

@@ -4,6 +4,7 @@
 A project designed to learn async Rust. Not intended for reuse.
 
 ```sh
+cargo nextest run # more/better tests coming
 cargo run -- --help
 ```
 
@@ -63,7 +64,7 @@ TODO
 -	Configurable queue wait time
 -	Configurable copy buffer sizes
 	-	8 KB default buffer size for `copy_bidirectional` not configurable
-	-	My solution would have to handle backpressure as well (sender fast than receiver e.g.)
+	-	My solution would have to handle backpressure as well (sender faster than receiver e.g.)
 -	Pathological cases
 	-	All backends fail to connect at the same time
 	-	DNS outage

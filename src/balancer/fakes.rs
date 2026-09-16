@@ -3,8 +3,10 @@ use crate::errors::ProxyError;
 use crate::state::ProxyConfig;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use tokio::io::{DuplexStream, duplex};
+
+// TODO: Documentation for how to use these fakes with examples
 
 pub enum BackendConnectionStub {
     Connect(DuplexStream),
@@ -16,10 +18,9 @@ pub enum BackendConnectionSpec {
     Fail(ProxyError),
 }
 
-pub struct FakeLoadBalancerBuilder {
-    config: Arc<ProxyConfig>,
+pub struct FakeLoadBalancerBuilder<'a> {
+    config: &'a ProxyConfig,
     ports: Vec<(u16, Vec<BackendConnectionSpec>)>,
-    /// Defaults to 64 KiB
     duplex_buf: usize,
 }
 
@@ -28,7 +29,7 @@ enum BackendConnectionResult {
     Fail(ProxyError),
 }
 
-impl FakeLoadBalancerBuilder {
+impl<'a> FakeLoadBalancerBuilder<'a> {
     pub fn add_port_connections(
         mut self,
         port: u16,
@@ -38,6 +39,7 @@ impl FakeLoadBalancerBuilder {
         self
     }
 
+    /// Defaults to 64 KiB
     pub fn set_duplex_buffer(mut self, size: usize) -> Self {
         self.duplex_buf = size;
         self
@@ -54,7 +56,7 @@ impl FakeLoadBalancerBuilder {
 
         for (port, specs) in self.ports {
             if !ports.contains(&port) {
-                panic!("Attempt to configure test behavior for an unbound port");
+                panic!("Attempt to configure test behavior for an unbound port {port}");
             }
             let mut sequence = VecDeque::new();
             for spec in specs {
@@ -85,7 +87,6 @@ impl FakeLoadBalancerBuilder {
                     }
                 }
             }
-            // build the behavior for the port
             port_connections.insert(port, Mutex::new(sequence));
         }
 
@@ -98,7 +99,7 @@ pub struct FakeLoadBalancer {
 }
 
 impl FakeLoadBalancer {
-    pub fn builder(config: Arc<ProxyConfig>) -> FakeLoadBalancerBuilder {
+    pub fn builder(config: &ProxyConfig) -> FakeLoadBalancerBuilder<'_> {
         FakeLoadBalancerBuilder {
             config,
             ports: Vec::new(),
@@ -107,6 +108,7 @@ impl FakeLoadBalancer {
     }
 }
 
+// Note that when this panics, it results in a log, not an actual panic
 impl LoadBalancer for FakeLoadBalancer {
     type Stream = DuplexStream;
 

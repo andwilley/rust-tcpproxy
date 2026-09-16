@@ -71,7 +71,7 @@ where
                     first_error.get_or_insert(listen_error);
                 }
                 Err(join_error) => {
-                    error!(err = %join_error, "listener task was cancelled or paniced");
+                    error!(err = %join_error, "listener task was cancelled or panicked");
                     self.cancel_token.cancel();
                     // Consider splitting cancellation and panic.
                     first_error.get_or_insert(ProxyError::TaskCancellation {
@@ -212,4 +212,85 @@ where
     let (mut out_sock, _) = balancer.connect_backend(port).await?;
     tokio::io::copy_bidirectional(&mut in_sock, &mut out_sock).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::balancer::fakes::{BackendConnectionSpec, BackendConnectionStub, FakeLoadBalancer};
+    use crate::config::{App, RawConfig};
+    use crate::network::fakes::{ClientConnectionSpec, ClientConnectionStub, FakeListenerFactory};
+    use std::net::Ipv6Addr;
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+
+    const PORT: u16 = 8080;
+
+    fn test_config() -> ProxyConfig {
+        ProxyConfig::try_from(&RawConfig {
+            apps: vec![App {
+                name: "test".to_string(),
+                ports: vec![PORT],
+                targets: vec!["backend.example.com:9000".to_string()],
+            }],
+        })
+        .expect("config")
+    }
+
+    // TODO: Utilities to make constructing the proxy and sending payloads simpler
+    #[tokio::test(start_paused = true)]
+    async fn proxy_bytes_round_trip() {
+        let config = test_config();
+        let cancel_token = CancellationToken::new();
+        let (listener_factory, mut client_stubs) = FakeListenerFactory::builder()
+            .add_port_connections(PORT, vec![ClientConnectionSpec::Connect { count: 1 }])
+            .build();
+        let (balancer, mut backend_stubs) = FakeLoadBalancer::builder(&config)
+            .add_port_connections(PORT, vec![BackendConnectionSpec::Connect { count: 1 }])
+            .build();
+        let ClientConnectionStub::Connect(client) = &mut client_stubs.get_mut(&PORT).unwrap()[0]
+        else {
+            panic!("expected connected client stub")
+        };
+        let BackendConnectionStub::Connect(backend) = &mut backend_stubs.get_mut(&PORT).unwrap()[0]
+        else {
+            panic!("expected connected backend stub")
+        };
+        let server_task = tokio::spawn(
+            ProxyServer::new(
+                listener_factory,
+                balancer,
+                Arc::new(config),
+                cancel_token.clone(),
+                10, // max_connections,
+                10, // max_queue,
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            )
+            .run(),
+        );
+
+        const FORWARD: &[u8] = b"client to proxy";
+        client.write_all(FORWARD).await.expect("write client");
+        let mut from_client = [0u8; FORWARD.len()];
+        backend
+            .read_exact(&mut from_client)
+            .await
+            .expect("read backend");
+        assert_eq!(&from_client, FORWARD);
+
+        const BACKWARD: &[u8] = b"backend to proxy";
+        backend.write_all(BACKWARD).await.expect("write backend");
+        let mut from_backend = [0u8; BACKWARD.len()];
+        client
+            .read_exact(&mut from_backend)
+            .await
+            .expect("read client");
+        assert_eq!(&from_backend, BACKWARD);
+        cancel_token.cancel();
+
+        // Close the connections so we exit cleanly
+        drop(client_stubs);
+        drop(backend_stubs);
+        server_task.await.expect("shutdown").expect("shutdown");
+    }
 }
