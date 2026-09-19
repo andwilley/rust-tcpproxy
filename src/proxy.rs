@@ -107,6 +107,8 @@ where
     let mut connections = JoinSet::new();
 
     loop {
+        // TODO: Consider also selecting on the joinset below so that cleaning up finished or
+        // panicked tasks doesn't have to wait on connections. Need to consider if this is safe.
         while let Some(res) = connections.try_join_next() {
             if let Err(e) = res {
                 error!(port, err = %e, "connection task panicked");
@@ -165,6 +167,7 @@ where
         Err(e) => {
             if let ProxyError::IoError(io_err) = &e {
                 let kind = io_err.kind();
+                // TODO: Instead look for transient errors here.
                 if kind == InvalidInput {
                     error!(port, err = %e, "fatal error on accept");
                     return Err(e);
@@ -221,8 +224,8 @@ mod tests {
     use crate::config::{App, RawConfig};
     use crate::network::fakes::{ClientConnectionSpec, ClientConnectionStub, FakeListenerFactory};
     use std::net::Ipv6Addr;
-    use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, DuplexStream};
 
     const PORT: u16 = 8080;
 
@@ -237,7 +240,21 @@ mod tests {
         .expect("config")
     }
 
-    // TODO: Utilities to make constructing the proxy and sending payloads simpler
+    async fn assert_proxied_bytes<const N: usize>(
+        source: &mut DuplexStream,
+        dest: &mut DuplexStream,
+        bytes: &[u8; N],
+    ) {
+        source.write_all(bytes).await.expect("successful write");
+        let mut from_source = [0u8; N];
+        dest.read_exact(&mut from_source)
+            .await
+            .expect("successful read");
+        assert_eq!(&from_source, bytes);
+    }
+
+    // TODO: A simple test harness for constructing and cleaning up the proxy. Utilities for
+    // extracting and pairing streams from the stub maps.
     #[tokio::test(start_paused = true)]
     async fn proxy_bytes_round_trip() {
         let config = test_config();
@@ -269,28 +286,29 @@ mod tests {
             .run(),
         );
 
-        const FORWARD: &[u8] = b"client to proxy";
-        client.write_all(FORWARD).await.expect("write client");
-        let mut from_client = [0u8; FORWARD.len()];
-        backend
-            .read_exact(&mut from_client)
-            .await
-            .expect("read backend");
-        assert_eq!(&from_client, FORWARD);
-
-        const BACKWARD: &[u8] = b"backend to proxy";
-        backend.write_all(BACKWARD).await.expect("write backend");
-        let mut from_backend = [0u8; BACKWARD.len()];
-        client
-            .read_exact(&mut from_backend)
-            .await
-            .expect("read client");
-        assert_eq!(&from_backend, BACKWARD);
-        cancel_token.cancel();
+        assert_proxied_bytes(client, backend, b"ping").await;
+        assert_proxied_bytes(backend, client, b"pong").await;
 
         // Close the connections so we exit cleanly
         drop(client_stubs);
         drop(backend_stubs);
+        cancel_token.cancel();
         server_task.await.expect("shutdown").expect("shutdown");
     }
+
+    // bind fails
+    // bind fails where 1 already succeeded, it gets canceled
+    // accept fails for permanent error, brings the proxy down
+    //   TODO: this should drain the connections on that port as well
+    // transient accept error, sleeps and tries again
+    // pool full, queue has space, accepts new connection
+    //   when a connection ends the queued connection is accepted
+    // pool full, queue full, does not accept new connection
+    //   when a connection finishes, a new one is accepted
+    // connect_backend fails, logs and allows new connections
+    // connection task panics, logs and continues
+    // shutdown with open connections, clean drain
+    // shutdown with open connections, forces close after limit
+    // listener tasks panics, proxy tears down
+    // test connections can half close properly
 }

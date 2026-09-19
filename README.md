@@ -47,6 +47,16 @@ I wanted to avoid `async-trait` mostly to learn using the newer native support f
 
 Most of the failures we handle can be transient, even NXDOMAIN, so a full drain is too heavy handed. Drain is reserved for use in user drains/undrains, which is unimplemented. We could be smarter about how we cool down, varying cooldowns based on the error, and tracking continuous failures.
 
+### Error handling
+
+Right now bind failures and an invalid input from accept tear down the proxy. Transient accept errors result in a 50ms wait and then an re-attempt on the listener for that port. This runs in a select in `listen` and functionally means that it both blocks any new connections over that port and that while we're sleeping we aren't polling cancellation. An exponential backoff here would mean potentially not polling cancellation for the duration of the backoff. In addition, if we do get a fatal accept error, we don't drain the other connections on this port.
+
+It seems reasonable to bounce the proxy if we simply cannot receive on one of the configured ports. The other reasonable option would be to continue serving on all other ports and make some noise about the port failure. For the sake of simplicity I'll stick with tearing down the proxy for now, expecting a restart.
+
+The accept error behavior needs to improve though. We do want to attempt to get through transient errors like exceeding fd limits, but we'll need a minor redesign to get better backoff behavior without blocking cancellation.
+
+Also need to dig into the right way to identify permanent errors from methods like accept, which might vary between machines. Need to ensure we tear down for any errors we cannot recover from and will waste cycles spinning against.
+
 TODO
 ----
 
