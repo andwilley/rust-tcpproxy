@@ -162,6 +162,8 @@ impl FakeListener {
 
 impl StreamListener for FakeListener {
     type Stream = DuplexStream;
+
+    // This must remain cancel safe. An await after the pop, for example, would break it.
     async fn accept(&self) -> Result<(Self::Stream, SocketAddr), ProxyError> {
         let next = self.connections.lock().unwrap().pop_front();
         match next {

@@ -107,13 +107,6 @@ where
     let mut connections = JoinSet::new();
 
     loop {
-        // TODO: Consider also selecting on the joinset below so that cleaning up finished or
-        // panicked tasks doesn't have to wait on connections. Need to consider if this is safe.
-        while let Some(res) = connections.try_join_next() {
-            if let Err(e) = res {
-                error!(port, err = %e, "connection task panicked");
-            }
-        }
         select! {
             accept_result = listener.accept() => {
                 let Err(e) = accept_connection(
@@ -128,6 +121,12 @@ where
                     };
                 return Err(e);
             }
+            // Clean up finished tasks.
+            Some(res) = connections.join_next() => {
+                if let Err(e) = res {
+                    error!(port, err = %e, "connection task panicked");
+                }
+            }
             _ = cancel_token.cancelled() => {
                 break;
             }
@@ -139,9 +138,7 @@ where
 
     info!(port, "Shutting down, attempting to drain open connections.");
     select! {
-        _ = async {
-            while connections.join_next().await.is_some() {}
-        } => {}
+        _ = async { while connections.join_next().await.is_some() {} } => {}
         _ = sleep(Duration::from_secs(10)) => {
             warn!(port, "Shutdown deadline reached, aborting.")
         }

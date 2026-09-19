@@ -16,6 +16,10 @@ pub trait StreamListenerFactory: Send + Sync + Clone {
 
 pub trait StreamListener: Send + Sync {
     type Stream: AsyncStream;
+
+    /// This needs to be cancel safe. Accept may be cancelled in-flight by the select it runs in
+    /// to clean up other tasks in the join set. If another task is selected before this one it must
+    /// be guaranteed that no connection was accepted.
     fn accept(&self)
     -> impl Future<Output = Result<(Self::Stream, SocketAddr), ProxyError>> + Send;
 }
