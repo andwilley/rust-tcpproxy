@@ -2,7 +2,7 @@ use crate::balancer::traits::LoadBalancer;
 use crate::errors::ProxyError;
 use crate::network::traits::{AsyncStream, StreamListener, StreamListenerFactory};
 use crate::state::ProxyConfig;
-use std::io::ErrorKind::InvalidInput;
+use std::io::ErrorKind::{ConnectionAborted, ConnectionRefused, ConnectionReset};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -106,31 +106,46 @@ where
         .await?;
     let mut connections = JoinSet::new();
 
-    loop {
-        select! {
-            accept_result = listener.accept() => {
-                let Err(e) = accept_connection(
-                        accept_result,
-                        port,
-                        balancer.clone(),
-                        open_connections.clone(),
-                        queued_connections.clone(),
-                        &mut connections
-                    ).await else {
+    let accept_res = select!(
+        result = async {
+            loop {
+                // Clean up finished tasks. This needs to wait for any currently running accepts to
+                // finish, which may have delay logging panics by the max backoff.
+                while let Some(res) = connections.try_join_next() {
+                    if let Err(e) = res {
+                        error!(port, err = %e, "connection task panicked");
+                    }
+                }
+                let accept_result = listener.accept().await;
+                match accept_connection(
+                    accept_result,
+                    port,
+                    balancer.clone(),
+                    open_connections.clone(),
+                    queued_connections.clone(),
+                    &mut connections
+                ) {
+                    // Try the next connection.
+                    AcceptResult::Connected |
+                    AcceptResult::RetryImmediately => { continue; }
+                    // Fixed wait for new connections in this state.
+                    AcceptResult::RejectedTooManyConnections => {
+                        sleep(Duration::from_millis(10)).await;
                         continue;
-                    };
-                return Err(e);
-            }
-            // Clean up finished tasks.
-            Some(res) = connections.join_next() => {
-                if let Err(e) = res {
-                    error!(port, err = %e, "connection task panicked");
+                    }
+                    // Tear down.
+                    AcceptResult::PermanentError(e) => { break Err(e); }
                 }
             }
-            _ = cancel_token.cancelled() => {
-                break;
-            }
+        } => {
+            result
         }
+        _ = cancel_token.cancelled() => { Ok(()) }
+    );
+
+    // Start tearing down the other listeners if we exited for an error.
+    if accept_res.is_err() {
+        cancel_token.cancel();
     }
 
     // Stop accepting connections while we shut down.
@@ -143,18 +158,25 @@ where
             warn!(port, "Shutdown deadline reached, aborting.")
         }
     }
-    Ok(())
+    accept_res
+}
+
+enum AcceptResult {
+    Connected,
+    RetryImmediately,
+    RejectedTooManyConnections,
+    PermanentError(ProxyError),
 }
 
 /// If capacity is available in the active pool or the queue, spawn a task to connect this request.
-async fn accept_connection<B, S>(
+fn accept_connection<B, S>(
     accept_result: Result<(S, SocketAddr), ProxyError>,
     port: u16,
     balancer: Arc<B>,
     open_connections: Arc<Semaphore>,
     queued_connections: Arc<Semaphore>,
     connections: &mut JoinSet<()>,
-) -> Result<(), ProxyError>
+) -> AcceptResult
 where
     B: LoadBalancer + 'static,
     S: AsyncStream,
@@ -164,16 +186,16 @@ where
         Err(e) => {
             if let ProxyError::IoError(io_err) = &e {
                 let kind = io_err.kind();
-                // TODO: Instead look for transient errors here.
-                if kind == InvalidInput {
-                    error!(port, err = %e, "fatal error on accept");
-                    return Err(e);
+                if matches!(
+                    kind,
+                    ConnectionRefused | ConnectionReset | ConnectionAborted
+                ) {
+                    warn!(port, err = %e, "transient accept error");
+                    return AcceptResult::RetryImmediately;
                 }
-                error!(port, err = %e, "transient error on accept");
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                return Ok(());
             }
-            return Err(e);
+            error!(port, err = %e, "permanent accept error");
+            return AcceptResult::PermanentError(e);
         }
     };
     let new_balancer = balancer.clone();
@@ -184,7 +206,7 @@ where
                 error!(port, err = %e, "Connection to backends failed")
             }
         });
-        return Ok(());
+        return AcceptResult::Connected;
     };
 
     if let Ok(queue_slot) = queued_connections.clone().try_acquire_owned() {
@@ -198,10 +220,10 @@ where
                 error!(port, err = %e, "Connection to backends failed")
             }
         });
-        return Ok(());
+        return AcceptResult::Connected;
     }
     error!(port, "Connection dropped, too many connections");
-    Ok(())
+    AcceptResult::RejectedTooManyConnections
 }
 
 async fn do_connection<S, B>(port: u16, mut in_sock: S, balancer: Arc<B>) -> Result<(), ProxyError>
@@ -296,8 +318,8 @@ mod tests {
     // bind fails
     // bind fails where 1 already succeeded, it gets canceled
     // accept fails for permanent error, brings the proxy down
-    //   TODO: this should drain the connections on that port as well
-    // transient accept error, sleeps and tries again
+    //   this should drain the connections on that port as well
+    // transient accept error, tries again immediately
     // pool full, queue has space, accepts new connection
     //   when a connection ends the queued connection is accepted
     // pool full, queue full, does not accept new connection

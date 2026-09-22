@@ -43,19 +43,19 @@ We don't require that we get 100% consistency. The cooldown state of a backend c
 
 I wanted to avoid `async-trait` mostly to learn using the newer native support for async functions in traits. This proxy doesn't have a need yet for anything other than statically defined types and trait implementations. There are some performance benefits as well, but I suspect they aren't significant.
 
-### Drain is unused
+### Drain
 
-Most of the failures we handle can be transient, even NXDOMAIN, so a full drain is too heavy handed. Drain is reserved for use in user drains/undrains, which is unimplemented. We could be smarter about how we cool down, varying cooldowns based on the error, and tracking continuous failures.
+On shutdown either via SIGINT or some error in accept, we attempt to drain the existing connections for 10s, after which we drop the remaining open connections. This could be cleaner, but is a reasonable simple first-pass.
 
-### Error handling
+The backend state `Drain` is unused currently. Most of the failures we handle can be transient, even NXDOMAIN, so a full drain is too heavy handed. Drain is reserved for use in user drains/undrains, which is unimplemented. We could be smarter about how we cool down, varying cooldowns based on the error, and tracking continuous failures.
 
-Right now bind failures and an invalid input from accept tear down the proxy. Transient accept errors result in a 50ms wait and then an re-attempt on the listener for that port. This runs in a select in `listen` and functionally means that it both blocks any new connections over that port and that while we're sleeping we aren't polling cancellation. An exponential backoff here would mean potentially not polling cancellation for the duration of the backoff. In addition, if we do get a fatal accept error, we don't drain the other connections on this port.
+### Accept Error Handling
 
-It seems reasonable to bounce the proxy if we simply cannot receive on one of the configured ports. The other reasonable option would be to continue serving on all other ports and make some noise about the port failure. For the sake of simplicity I'll stick with tearing down the proxy for now, expecting a restart.
+There is some but not total agreement about how to handle errors in libraries and binaries like this in the broader community. Most proxy libraries in the Rust ecosystem seem to take an "always up" approach by default, which makes sense from a library perspective. Very few do any sort of exponential backoff, and most do not bound their retries for a failed accept. Many of these don't either don't expose the OS-level error to the library client or use `ErrorKind`, which doesn't currently handle all of the OS-level classifications that can matter to these proxies. There are a few `ErrorKind`s that most consider immediately retriable: `ConnectionRefused`, `ConnectionAborted`, `ConnectionReset`.
 
-The accept error behavior needs to improve though. We do want to attempt to get through transient errors like exceeding fd limits, but we'll need a minor redesign to get better backoff behavior without blocking cancellation.
+There is a choice broadly between "stay up and limp" and "crash and log" in some sense. Most libraries make the assumption that the client would want to keep running in a wounded state and make a bit of noise about what is failing, but this seems like a trade off between limping and bouncing / potentially crash looping. This binary makes the choice to prefer crashing when we lose a port to a fatal error. The rationale is that we're configured to run on a set of ports, and if we can't do that, we should crash and dump. The most common condition these libraries discuss is fd exhaustion (either per process or for the system) and because we attempt to control volume with the queue, a crash is more appropriate as it suggests misconfiguration. This behavior is similar to the hyper [`set_sleep_on_errors(false)`](https://github.com/hyperium/hyper/blob/v0.14.30/src/server/tcp.rs#L201) option.
 
-Also need to dig into the right way to identify permanent errors from methods like accept, which might vary between machines. Need to ensure we tear down for any errors we cannot recover from and will waste cycles spinning against.
+We use a short fixed backoff if we drop a connection for too many connections (a full pool + full queue). For the three `Connect`s above we retry immediately. For any other error we teardown the whole proxy.
 
 TODO
 ----
@@ -68,13 +68,13 @@ TODO
 -	Validate config targets on load
 -	Documentation comments throughout
 -	Metrics/telemetry
--	Check file descriptor limits
+-	Check file descriptor limits, possibly fail fast for misconfig with pool + queue size
 -	Remove ArcSwap types from public APIs (TargetState)
 -	Improve the configuration structure
 -	Configurable queue wait time
 -	Configurable copy buffer sizes
 	-	8 KB default buffer size for `copy_bidirectional` not configurable
-	-	My solution would have to handle backpressure as well (sender faster than receiver e.g.)
+	-	This would have to handle backpressure as well (sender faster than receiver e.g.)
 -	Pathological cases
 	-	All backends fail to connect at the same time
 	-	DNS outage
