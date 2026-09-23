@@ -318,7 +318,7 @@ mod tests {
     // bind fails
     // bind fails where 1 already succeeded, it gets canceled
     // accept fails for permanent error, brings the proxy down
-    //   this should drain the connections on that port as well
+    //   test this drains the connections on that port as well
     // transient accept error, tries again immediately
     // pool full, queue has space, accepts new connection
     //   when a connection ends the queued connection is accepted
