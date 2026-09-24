@@ -43,9 +43,11 @@ We don't require that we get 100% consistency. The cooldown state of a backend c
 
 I wanted to avoid `async-trait` mostly to learn using the newer native support for async functions in traits. This proxy doesn't have a need yet for anything other than statically defined types and trait implementations. There are some performance benefits as well, but I suspect they aren't significant.
 
-### Drain
+### Shutdown Drain
 
 On shutdown either via SIGINT or some error in accept, we attempt to drain the existing connections for 10s, after which we drop the remaining open connections. This could be cleaner, but is a reasonable simple first-pass.
+
+### Backend Drain
 
 The backend state `Drain` is unused currently. Most of the failures we handle can be transient, even NXDOMAIN, so a full drain is too heavy handed. Drain is reserved for use in user drains/undrains, which is unimplemented. We could be smarter about how we cool down, varying cooldowns based on the error, and tracking continuous failures.
 
@@ -57,12 +59,16 @@ There is a choice broadly between "stay up and limp" and "crash and log" in some
 
 We use a short fixed backoff if we drop a connection for too many connections (a full pool + full queue). For the three `Connect`s above we retry immediately. For any other error we teardown the whole proxy.
 
+### Bind Error Handling
+
+We fail eagerly for all bind errors. Ports are bound serially before listeners are registered to avoid needing to drain ports on a bind failure. Almost all of the existing proxies retry bind for address in use errors, which we likely should as well.
+
 TODO
 ----
 
 -	Next: Testing
 	-	Mock traits for testing [in progress]
-	-	Unit tests
+	-	Unit tests [in progress]
 	-	Manual end-to-end test with fake backends
 	-	Load tests, performance benchmarks
 -	Validate config targets on load

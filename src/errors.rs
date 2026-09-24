@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -10,6 +11,13 @@ pub enum ProxyError {
 
     #[error("Address {addr} is invalid: {message}")]
     BadAddressError { addr: String, message: String },
+
+    #[error("Failed to bind {addr}")]
+    BindError {
+        addr: String,
+        #[source]
+        source: std::io::Error,
+    },
 
     #[error("Error resolving targets for {port}: {message}")]
     TargetResolutionError { port: u16, message: String },
@@ -37,6 +45,19 @@ pub enum ProxyError {
 
     #[error("Permanent DNS error: {message}")]
     DnsNxError { message: String },
+}
+
+impl ProxyError {
+    /// Reclassify an IoError as a bind failure, attaching the address. Other variants pass through
+    pub fn maybe_into_bind_error(self, addr: &SocketAddr) -> Self {
+        match self {
+            ProxyError::IoError(source) => ProxyError::BindError {
+                addr: addr.to_string(),
+                source,
+            },
+            other => other,
+        }
+    }
 }
 
 impl From<hickory_resolver::net::NetError> for ProxyError {

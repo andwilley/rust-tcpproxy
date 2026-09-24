@@ -50,15 +50,24 @@ where
 
     pub async fn run(self) -> Result<(), ProxyError> {
         let mut handles = JoinSet::new();
+        let mut port_listeners = Vec::with_capacity(self.ports.len());
         for port in self.ports {
+            let addr = SocketAddr::new(self.bind_addr, port);
+            let listener = self
+                .listener_factory
+                .bind(&addr)
+                .await
+                .map_err(|e| e.maybe_into_bind_error(&addr))?;
+            port_listeners.push((port, listener));
+        }
+        for (port, listener) in port_listeners {
             handles.spawn(listen(
                 port,
-                self.listener_factory.clone(),
+                listener,
                 self.balancer.clone(),
                 self.open_connections.clone(),
                 self.queued_connections.clone(),
                 self.cancel_token.clone(),
-                self.bind_addr,
             ));
         }
         let mut first_error: Option<ProxyError> = None;
@@ -90,20 +99,16 @@ where
 
 async fn listen<L, B>(
     port: u16,
-    listener_factory: L,
+    listener: L,
     balancer: Arc<B>,
     open_connections: Arc<Semaphore>,
     queued_connections: Arc<Semaphore>,
     cancel_token: CancellationToken,
-    bind_addr: IpAddr,
 ) -> Result<(), ProxyError>
 where
-    L: StreamListenerFactory + 'static,
+    L: StreamListener + 'static,
     B: LoadBalancer + 'static,
 {
-    let listener = listener_factory
-        .bind(&SocketAddr::new(bind_addr, port))
-        .await?;
     let mut connections = JoinSet::new();
 
     let accept_res = select!(
@@ -315,8 +320,41 @@ mod tests {
         server_task.await.expect("shutdown").expect("shutdown");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn bind_fails_proxy_tears_down() {
+        let config = test_config();
+        let cancel_token = CancellationToken::new();
+        let bind_error = ProxyError::IoError(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "bind error",
+        ));
+        let (listener_factory, _) = FakeListenerFactory::builder()
+            .fail_port(PORT, bind_error)
+            .build();
+        let (balancer, _) = FakeLoadBalancer::builder(&config).build();
+
+        match ProxyServer::new(
+            listener_factory,
+            balancer,
+            Arc::new(config),
+            cancel_token.clone(),
+            10, // max_connections,
+            10, // max_queue,
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        )
+        .run()
+        .await
+        {
+            Err(ProxyError::BindError { source, .. }) => {
+                assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            e => {
+                panic!("Expected bind error but got {:?}", e);
+            }
+        };
+    }
+
     // bind fails
-    // bind fails where 1 already succeeded, it gets canceled
     // accept fails for permanent error, brings the proxy down
     //   test this drains the connections on that port as well
     // transient accept error, tries again immediately
