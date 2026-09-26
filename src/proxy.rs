@@ -244,16 +244,84 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::balancer::fakes::{BackendConnectionSpec, BackendConnectionStub, FakeLoadBalancer};
+    use crate::balancer::fakes::{
+        BackendConnectionSpec, BackendConnectionStub, BackendStubMap, FakeLoadBalancer,
+        FakeLoadBalancerBuilder,
+    };
     use crate::config::{App, RawConfig};
-    use crate::network::fakes::{ClientConnectionSpec, ClientConnectionStub, FakeListenerFactory};
+    use crate::network::fakes::{
+        ClientConnectionSpec, ClientConnectionStub, ClientStubMap, FakeListenerFactory,
+        FakeListenerFactoryBuilder,
+    };
     use std::net::Ipv6Addr;
     use tokio::io::AsyncWriteExt;
     use tokio::io::{AsyncReadExt, DuplexStream};
+    use tokio::task::JoinHandle;
+
+    #[tokio::test(start_paused = true)]
+    async fn proxy_bytes_round_trip() {
+        let config = default_config();
+        let mut harness_builder = ProxyHarness::builder(config);
+        harness_builder
+            .configure_listener()
+            .add_port_connections(PORT, vec![ClientConnectionSpec::Connect { count: 1 }]);
+        harness_builder
+            .configure_balancer()
+            .add_port_connections(PORT, vec![BackendConnectionSpec::Connect { count: 1 }]);
+        let mut harness = harness_builder.start();
+
+        let (ClientConnectionStub::Connect(client), BackendConnectionStub::Connect(backend)) =
+            &mut harness.stub_pair(PORT, 0)
+        else {
+            panic!("expected connections")
+        };
+
+        assert_proxied_bytes(client, backend, b"ping").await;
+        assert_proxied_bytes(backend, client, b"pong").await;
+
+        harness.close_connections();
+        harness.shutdown_assert_ok().await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bind_fails_proxy_tears_down() {
+        let config = default_config();
+        let bind_error = ProxyError::IoError(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "bind error",
+        ));
+        let mut harness_builder = ProxyHarness::builder(config);
+        harness_builder
+            .configure_listener()
+            .fail_port(PORT, bind_error);
+        let harness = harness_builder.start();
+        match harness.join().await {
+            Err(ProxyError::BindError { source, .. }) => {
+                assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            e => {
+                panic!("Expected bind error but got {:?}", e);
+            }
+        };
+    }
+
+    // accept fails for permanent error, brings the proxy down
+    //   test this drains the connections on that port as well
+    // transient accept error, tries again immediately
+    // pool full, queue has space, accepts new connection
+    //   when a connection ends the queued connection is accepted
+    // pool full, queue full, does not accept new connection
+    //   when a connection finishes, a new one is accepted
+    // connect_backend fails, logs and allows new connections
+    // connection task panics, logs and continues
+    // shutdown with open connections, clean drain
+    // shutdown with open connections, forces close after limit
+    // listener tasks panics, proxy tears down
+    // test connections can half close properly
 
     const PORT: u16 = 8080;
 
-    fn test_config() -> ProxyConfig {
+    fn default_config() -> ProxyConfig {
         ProxyConfig::try_from(&RawConfig {
             apps: vec![App {
                 name: "test".to_string(),
@@ -277,95 +345,107 @@ mod tests {
         assert_eq!(&from_source, bytes);
     }
 
-    // TODO: A simple test harness for constructing and cleaning up the proxy. Utilities for
-    // extracting and pairing streams from the stub maps.
-    #[tokio::test(start_paused = true)]
-    async fn proxy_bytes_round_trip() {
-        let config = test_config();
-        let cancel_token = CancellationToken::new();
-        let (listener_factory, mut client_stubs) = FakeListenerFactory::builder()
-            .add_port_connections(PORT, vec![ClientConnectionSpec::Connect { count: 1 }])
-            .build();
-        let (balancer, mut backend_stubs) = FakeLoadBalancer::builder(&config)
-            .add_port_connections(PORT, vec![BackendConnectionSpec::Connect { count: 1 }])
-            .build();
-        let ClientConnectionStub::Connect(client) = &mut client_stubs.get_mut(&PORT).unwrap()[0]
-        else {
-            panic!("expected connected client stub")
-        };
-        let BackendConnectionStub::Connect(backend) = &mut backend_stubs.get_mut(&PORT).unwrap()[0]
-        else {
-            panic!("expected connected backend stub")
-        };
-        let server_task = tokio::spawn(
-            ProxyServer::new(
+    /// Manages the running proxy and exposes connections and control.
+    /// TODO:
+    /// - pair should pop not match idx.
+    /// - add "unexpected warn+ logs throw" and "unreceived expected logs throw"
+    /// - setters for queue and pool size
+    /// - impl Drop to ensure that the proxy task is cancelled properly
+    struct ProxyHarness {
+        cancel_token: CancellationToken,
+        task: JoinHandle<Result<(), ProxyError>>,
+        stubs: Option<(ClientStubMap, BackendStubMap)>,
+    }
+
+    impl ProxyHarness {
+        fn builder(config: ProxyConfig) -> ProxyHarnessBuilder {
+            ProxyHarnessBuilder {
+                config,
+                listener_builder: FakeListenerFactory::builder(),
+                balancer_builder: FakeLoadBalancer::builder(),
+            }
+        }
+
+        fn stub_pair(
+            &mut self,
+            port: u16,
+            idx: usize,
+        ) -> (&mut ClientConnectionStub, &mut BackendConnectionStub) {
+            let (clients, backends) = self.stubs.as_mut().expect("connections already closed");
+            let client_stub = &mut clients.get_mut(&port).expect("client port")[idx];
+            let backend_stub = &mut backends.get_mut(&port).expect("backend port")[idx];
+            (client_stub, backend_stub)
+        }
+
+        /// Drop the connection maps which terminates open connections with EOF.
+        fn close_connections(&mut self) {
+            self.stubs = None
+        }
+
+        /// Waits for the proxy to finish, propogating panics.
+        async fn join(self) -> Result<(), ProxyError> {
+            match self.task.await {
+                Ok(res) => res,
+                Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+                Err(e) => panic!("proxy task cancelled: {e}"),
+            }
+        }
+
+        /// Tear down the proxy. Does not close connections. You must await the task via
+        /// ProxyHarness::join().
+        fn cancel(&self) {
+            self.cancel_token.cancel();
+        }
+
+        /// Tears down the proxy.
+        async fn shutdown(self) -> Result<(), ProxyError> {
+            self.cancel();
+            self.join().await
+        }
+
+        /// Tears down the proxy, expects a clean shutdown.
+        async fn shutdown_assert_ok(self) {
+            match self.shutdown().await {
+                Ok(()) => {}
+                Err(e) => panic!("expected OK on shutdown but got: {e}"),
+            }
+        }
+    }
+
+    struct ProxyHarnessBuilder {
+        config: ProxyConfig,
+        listener_builder: FakeListenerFactoryBuilder,
+        balancer_builder: FakeLoadBalancerBuilder,
+    }
+
+    impl ProxyHarnessBuilder {
+        fn configure_listener(&mut self) -> &mut FakeListenerFactoryBuilder {
+            &mut self.listener_builder
+        }
+
+        fn configure_balancer(&mut self) -> &mut FakeLoadBalancerBuilder {
+            &mut self.balancer_builder
+        }
+
+        fn start(self) -> ProxyHarness {
+            let (listener_factory, client_stubs) = self.listener_builder.build();
+            let (balancer, backend_stubs) = self.balancer_builder.build(&self.config);
+            let cancel_token = CancellationToken::new();
+            let proxy = ProxyServer::new(
                 listener_factory,
                 balancer,
-                Arc::new(config),
+                Arc::new(self.config),
                 cancel_token.clone(),
                 10, // max_connections,
                 10, // max_queue,
                 IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-            )
-            .run(),
-        );
-
-        assert_proxied_bytes(client, backend, b"ping").await;
-        assert_proxied_bytes(backend, client, b"pong").await;
-
-        // Close the connections so we exit cleanly
-        drop(client_stubs);
-        drop(backend_stubs);
-        cancel_token.cancel();
-        server_task.await.expect("shutdown").expect("shutdown");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn bind_fails_proxy_tears_down() {
-        let config = test_config();
-        let cancel_token = CancellationToken::new();
-        let bind_error = ProxyError::IoError(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "bind error",
-        ));
-        let (listener_factory, _) = FakeListenerFactory::builder()
-            .fail_port(PORT, bind_error)
-            .build();
-        let (balancer, _) = FakeLoadBalancer::builder(&config).build();
-
-        match ProxyServer::new(
-            listener_factory,
-            balancer,
-            Arc::new(config),
-            cancel_token.clone(),
-            10, // max_connections,
-            10, // max_queue,
-            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-        )
-        .run()
-        .await
-        {
-            Err(ProxyError::BindError { source, .. }) => {
-                assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+            );
+            let task = tokio::spawn(proxy.run());
+            ProxyHarness {
+                cancel_token,
+                task,
+                stubs: Some((client_stubs, backend_stubs)),
             }
-            e => {
-                panic!("Expected bind error but got {:?}", e);
-            }
-        };
+        }
     }
-
-    // bind fails
-    // accept fails for permanent error, brings the proxy down
-    //   test this drains the connections on that port as well
-    // transient accept error, tries again immediately
-    // pool full, queue has space, accepts new connection
-    //   when a connection ends the queued connection is accepted
-    // pool full, queue full, does not accept new connection
-    //   when a connection finishes, a new one is accepted
-    // connect_backend fails, logs and allows new connections
-    // connection task panics, logs and continues
-    // shutdown with open connections, clean drain
-    // shutdown with open connections, forces close after limit
-    // listener tasks panics, proxy tears down
-    // test connections can half close properly
 }

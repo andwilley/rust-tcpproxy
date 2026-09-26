@@ -66,14 +66,14 @@ We fail eagerly for all bind errors. Ports are bound serially before listeners a
 TODO
 ----
 
--	Next: Testing
+-	In Progress: Testing
 	-	Mock traits for testing [in progress]
 	-	Unit tests [in progress]
 	-	Manual end-to-end test with fake backends
 	-	Load tests, performance benchmarks
+-	Next: Metrics/telemetry
 -	Validate config targets on load
 -	Documentation comments throughout
--	Metrics/telemetry
 -	Check file descriptor limits, possibly fail fast for misconfig with pool + queue size
 -	Remove ArcSwap types from public APIs (TargetState)
 -	Improve the configuration structure

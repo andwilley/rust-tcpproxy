@@ -18,8 +18,9 @@ pub enum BackendConnectionSpec {
     Fail(ProxyError),
 }
 
-pub struct FakeLoadBalancerBuilder<'a> {
-    config: &'a ProxyConfig,
+pub type BackendStubMap = HashMap<u16, Vec<BackendConnectionStub>>;
+
+pub struct FakeLoadBalancerBuilder {
     ports: Vec<(u16, Vec<BackendConnectionSpec>)>,
     duplex_buf: usize,
 }
@@ -29,26 +30,29 @@ enum BackendConnectionResult {
     Fail(ProxyError),
 }
 
-impl<'a> FakeLoadBalancerBuilder<'a> {
+impl FakeLoadBalancerBuilder {
     pub fn add_port_connections(
-        mut self,
+        &mut self,
         port: u16,
         backend_connections: Vec<BackendConnectionSpec>,
-    ) -> Self {
+    ) -> &mut Self {
         self.ports.push((port, backend_connections));
         self
     }
 
     /// Defaults to 64 KiB
-    pub fn set_duplex_buffer(mut self, size: usize) -> Self {
+    pub fn set_duplex_buffer(&mut self, size: usize) -> &Self {
         self.duplex_buf = size;
         self
     }
 
     /// Build the configured balancer. Also returns the downstream-sides for each attempted
     /// connection in order of connection.
-    pub fn build(self) -> (FakeLoadBalancer, HashMap<u16, Vec<BackendConnectionStub>>) {
-        let ports: HashSet<u16> = self.config.ports().collect();
+    pub fn build(
+        self,
+        config: &ProxyConfig,
+    ) -> (FakeLoadBalancer, HashMap<u16, Vec<BackendConnectionStub>>) {
+        let ports: HashSet<u16> = config.ports().collect();
         let mut port_connections: HashMap<u16, Mutex<VecDeque<BackendConnectionResult>>> =
             HashMap::new();
         let mut test_sides: HashMap<u16, Vec<BackendConnectionStub>> = HashMap::new();
@@ -99,9 +103,8 @@ pub struct FakeLoadBalancer {
 }
 
 impl FakeLoadBalancer {
-    pub fn builder(config: &ProxyConfig) -> FakeLoadBalancerBuilder<'_> {
+    pub fn builder() -> FakeLoadBalancerBuilder {
         FakeLoadBalancerBuilder {
-            config,
             ports: Vec::new(),
             duplex_buf: 1024 * 64,
         }

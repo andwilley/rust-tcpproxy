@@ -68,6 +68,8 @@ pub enum ClientConnectionStub {
     Fail,
 }
 
+pub type ClientStubMap = HashMap<u16, Vec<ClientConnectionStub>>;
+
 pub struct FakeListenerFactoryBuilder {
     ports: Vec<(u16, Vec<ClientConnectionSpec>)>,
     failed_ports: Vec<(u16, ProxyError)>,
@@ -76,22 +78,22 @@ pub struct FakeListenerFactoryBuilder {
 
 impl FakeListenerFactoryBuilder {
     pub fn add_port_connections(
-        mut self,
+        &mut self,
         port: u16,
         client_connections: Vec<ClientConnectionSpec>,
-    ) -> Self {
+    ) -> &mut Self {
         self.ports.push((port, client_connections));
         self
     }
 
     /// Overrides any behavior already specified by add_port_connections.
-    pub fn fail_port(mut self, port: u16, error: ProxyError) -> Self {
+    pub fn fail_port(&mut self, port: u16, error: ProxyError) -> &mut Self {
         self.failed_ports.push((port, error));
         self
     }
 
     /// Defaults to 64 KiB
-    pub fn set_duplex_buffer(mut self, size: usize) -> Self {
+    pub fn set_duplex_buffer(&mut self, size: usize) -> &mut Self {
         self.duplex_buf = size;
         self
     }
