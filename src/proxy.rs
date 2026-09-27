@@ -347,9 +347,11 @@ mod tests {
 
     /// Manages the running proxy and exposes connections and control.
     /// TODO:
-    /// - pair should pop not match idx.
+    /// - we should pop owned ends not match idx for pairs.
+    /// - we need to have the test dictate accept advancement, thinking about a channel based accept
+    ///   with a method on the hanlder to connect_next, which hands out the next client/backend pair.
     /// - add "unexpected warn+ logs throw" and "unreceived expected logs throw"
-    /// - setters for queue and pool size
+    /// - setters for queue and pool size on the harness builder
     /// - impl Drop to ensure that the proxy task is cancelled properly
     struct ProxyHarness {
         cancel_token: CancellationToken,

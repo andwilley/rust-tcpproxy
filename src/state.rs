@@ -1,15 +1,16 @@
 use crate::config::RawConfig;
 use crate::errors::ProxyError;
 use arc_swap::{ArcSwap, Guard};
+use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
+use std::collections::btree_map::Entry;
 use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Debug, Default)]
 pub struct ProxyConfig {
     target_pools: Vec<Vec<String>>,
-    port_to_pool: HashMap<u16, usize>,
+    port_to_pool: BTreeMap<u16, usize>,
 }
 
 // TODO: This should not expose ArcSwap internals
@@ -88,7 +89,7 @@ impl TryFrom<&RawConfig> for ProxyConfig {
 
     fn try_from(raw: &RawConfig) -> Result<ProxyConfig, Self::Error> {
         let mut target_pools = Vec::new();
-        let mut port_to_pool = HashMap::<u16, usize>::new();
+        let mut port_to_pool = BTreeMap::<u16, usize>::new();
 
         for app in &raw.apps {
             target_pools.push(app.targets.clone());
