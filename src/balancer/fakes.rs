@@ -15,6 +15,7 @@ pub struct FakeLoadBalancer {
     connection_commands: HashMap<u16, Mutex<UnboundedReceiver<ConnectCommand>>>,
 }
 
+/// Alias for the request that arrives on the connect channel.
 pub type ConnectCommand = Result<(DuplexStream, SocketAddr), ProxyError>;
 
 impl FakeLoadBalancer {
