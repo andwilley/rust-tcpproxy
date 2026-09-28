@@ -365,9 +365,11 @@ mod tests {
             let client_addr = format!("127.0.0.1:{}", 40000 + self.client_ctr)
                 .parse()
                 .expect("valid downstream address");
+            self.client_ctr += 1;
             let backend_addr = format!("127.0.0.1:{}", 9000 + self.backend_ctr)
                 .parse()
                 .expect("valid downstream address");
+            self.backend_ctr += 1;
             let (ack_tx, ack_rx) = oneshot::channel();
             self.connect_commands
                 .get(&port)
@@ -400,6 +402,7 @@ mod tests {
             let client_addr = format!("127.0.0.1:{}", 40000 + self.client_ctr)
                 .parse()
                 .expect("valid downstream address");
+            self.client_ctr += 1;
             let (ack_tx, ack_rx) = oneshot::channel();
             self.connect_commands
                 .get(&port)
@@ -422,6 +425,7 @@ mod tests {
             let client_addr = format!("127.0.0.1:{}", 40000 + self.client_ctr)
                 .parse()
                 .expect("valid downstream address");
+            self.client_ctr += 1;
             let (ack_tx, ack_rx) = oneshot::channel();
             self.accept_commands
                 .get(&port)
