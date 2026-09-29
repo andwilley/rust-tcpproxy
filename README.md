@@ -63,29 +63,39 @@ We use a short fixed backoff if we drop a connection for too many connections (a
 
 We fail eagerly for all bind errors. Ports are bound serially before listeners are registered to avoid needing to drain ports on a bind failure. Almost all of the existing proxies retry bind for address in use errors, which we likely should as well.
 
+### Proxy Test Harness
+
+We use a channel-based accept and connect (in a single threaded runtime) where the test harness initiates connections and the timing between them. Accept awaits a command from the test, a stream or an error along with a one-shot channel to synchronize the test with the accept. Accept returns the commanded stream or error, after which all processing to handle the accept and potentially spawn the connection task is synchronous. Running in a single-threaded runtime means we can ensure that when an accept runs, we can push exactly the backend stream half (or connection error) the test needs. Backend commands work similarly, by convention sent before the accept commands so they queue before accept completes (behind the ack), before any connection task is spawned. The backend commands can be synchronous. We use an unbounded channel in both cases which gives us synchronous sends.
+
+This setup gives the test deterministic control of connection pairing and ordering as well as the ability to sequence connections to setup specific behavior. Single-threaded execution is a drawback, but is still useful to test much of the proxy logic deterministically. We should rely on integration-style tests to exercise both the multi-threaded behavior and the production implementations of the network and balancer traits.
+
+This setup, though less so than the one below, still risks misalignment between the client and backend pair if we're not careful. Harness methods attempt to avoid this by construction, e.g. the backend_connect_fail method doesn't return a backend, only a client. I added `no_backend` to the harness, which creates a client connection but no backend connection expecting the attempt to bail between accept and connection to a backend (too many connections was the motivating case). I've added timeouts so that hopefully we can see this mistake as a panic rather than a hang (in start_paused), but it might be prudent to improve the safety here eventually.
+
+I landed on this after a few iterations that fell a bit short. First attempt was to define a script in a builder for the fake listener and balancer (client and backend connection order and behavior) as in [e605b2f](https://github.com/andwilley/rust-tcpproxy/commit/e605b2f14d87db0d0ed400c8331638c088a88eae). This allowed the test to define a series of behaviors during setup and make assertions about them once the proxy started. Even with a test harness ([fa460ea](https://github.com/andwilley/rust-tcpproxy/commit/fa460ea3ec2ed18f0736289939590ae1a932c33a)) to manage starting and tearing down the proxy this was awkward and error prone. It forced the test author to essentially write the sequence they were trying to test in three different places, the accept script, the backend script, and the assertions. It had the additional downside that the entire script, every accept and connection, was run eagerly when the first read was awaited in the test. This made tests that relied on timing of several events difficult or impossible to express or make any assertions about.
+
 TODO
 ----
 
--	In Progress: Testing
-	-	Mock traits for testing [in progress]
-	-	Unit tests [in progress]
-	-	Manual end-to-end test with fake backends
-	-	Load tests, performance benchmarks
--	Next: Metrics/telemetry
--	Validate config targets on load
--	Documentation comments throughout
--	Check file descriptor limits, possibly fail fast for misconfig with pool + queue size
--	Remove ArcSwap types from public APIs (TargetState)
--	Improve the configuration structure
--	Configurable queue wait time
--	Configurable copy buffer sizes
-	-	8 KB default buffer size for `copy_bidirectional` not configurable
-	-	This would have to handle backpressure as well (sender faster than receiver e.g.)
--	Pathological cases
-	-	All backends fail to connect at the same time
-	-	DNS outage
-	-	Malicious clients (slow loris, retry storm, etc)
--	Configurable overall connection timeout
+- [ ]	In Progress: Testing
+	- [x]	Mock traits for testing [in progress]
+	- [ ]	Unit tests [in progress]
+	- [ ]	Manual end-to-end test with fake backends
+	- [ ]	Load tests, performance benchmarks
+- [ ]	Next: Metrics/telemetry
+- [ ]	Validate config targets on load
+- [ ]	Documentation comments throughout
+- [ ]	Check file descriptor limits, possibly fail fast for misconfig with pool + queue size
+- [ ]	Remove ArcSwap types from public APIs (TargetState)
+- [ ]	Improve the configuration structure
+- [ ]	Configurable queue wait time
+- [ ]	Configurable copy buffer sizes
+	- [ ]	8 KB default buffer size for `copy_bidirectional` not configurable
+	- [ ]	This would have to handle backpressure as well (sender faster than receiver e.g.)
+- [ ]	Pathological cases
+	- [ ]	All backends fail to connect at the same time
+	- [ ]	DNS outage
+	- [ ]	Malicious clients (slow loris, retry storm, etc)
+- [ ]	Configurable overall connection timeout
 
 Future features
 ---------------
