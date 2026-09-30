@@ -115,7 +115,8 @@ where
         result = async {
             loop {
                 // Clean up finished tasks. This needs to wait for any currently running accepts to
-                // finish, which may have delay logging panics by the max backoff.
+                // finish, which may delay logging panics by the max backoff. Consider moving this
+                // into the select.
                 while let Some(res) = connections.try_join_next() {
                     if let Err(e) = res {
                         error!(port, err = %e, "connection task panicked");
@@ -133,9 +134,8 @@ where
                     // Try the next connection.
                     AcceptResult::Connected |
                     AcceptResult::RetryImmediately => { continue; }
-                    // Fixed wait for new connections in this state.
+                    // Fail fast for queue full.
                     AcceptResult::RejectedTooManyConnections => {
-                        sleep(Duration::from_millis(10)).await;
                         continue;
                     }
                     // Tear down.
@@ -263,8 +263,20 @@ mod tests {
         let mut harness = ProxyHarness::builder(config).start();
         let (mut client, mut backend) = harness.proxied(PORT).await;
 
-        assert_proxied_bytes(&mut client, &mut backend, b"request").await;
-        assert_proxied_bytes(&mut backend, &mut client, b"response").await;
+        assert_proxied_bytes(
+            &mut client,
+            &mut backend,
+            b"request",
+            START_PAUSED_ASSERT_WAIT,
+        )
+        .await;
+        assert_proxied_bytes(
+            &mut backend,
+            &mut client,
+            b"response",
+            START_PAUSED_ASSERT_WAIT,
+        )
+        .await;
 
         // Close connections before shutdown.
         drop(client);
@@ -303,8 +315,20 @@ mod tests {
         let mut harness = ProxyHarness::builder(config).start();
         let (mut client1, mut backend1) = harness.proxied(PORT).await;
 
-        assert_proxied_bytes(&mut client1, &mut backend1, b"request").await;
-        assert_proxied_bytes(&mut backend1, &mut client1, b"response").await;
+        assert_proxied_bytes(
+            &mut client1,
+            &mut backend1,
+            b"request",
+            START_PAUSED_ASSERT_WAIT,
+        )
+        .await;
+        assert_proxied_bytes(
+            &mut backend1,
+            &mut client1,
+            b"response",
+            START_PAUSED_ASSERT_WAIT,
+        )
+        .await;
 
         harness.accept_fail(PORT, accept_perm_error).await;
 
@@ -317,22 +341,206 @@ mod tests {
             }
         };
 
-        let mut buf: &mut [u8] = &mut [0u8; 4];
-        match client1.read(&mut buf).await {
-            Ok(0) => {}
-            any => panic!("expected disconnectioned client but read returned: {any:?}"),
-        }
-        match backend1.read(&mut buf).await {
-            Ok(0) => {}
-            any => panic!("expected disconnectioned backend but read returned: {any:?}"),
-        }
+        assert_connection_closed(&mut client1, START_PAUSED_ASSERT_WAIT).await;
+        assert_connection_closed(&mut backend1, START_PAUSED_ASSERT_WAIT).await;
     }
 
-    // transient accept error, tries again immediately
-    // pool full, queue has space, accepts new connection
-    //   when a connection ends the queued connection is accepted
-    // pool full, queue full, does not accept new connection
-    //   when a connection finishes, a new one is accepted
+    #[tokio::test(start_paused = true)]
+    async fn accept_fails_transient_proxy_continues() {
+        let config = default_config();
+        let accept_trans_error = ProxyError::IoError(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "accept error",
+        ));
+        let mut harness = ProxyHarness::builder(config).start();
+
+        harness.accept_fail(PORT, accept_trans_error).await;
+        let (mut client, mut backend) = harness.proxied(PORT).await;
+
+        assert_proxied_bytes(
+            &mut client,
+            &mut backend,
+            b"request",
+            START_PAUSED_ASSERT_WAIT,
+        )
+        .await;
+        assert_proxied_bytes(
+            &mut backend,
+            &mut client,
+            b"response",
+            START_PAUSED_ASSERT_WAIT,
+        )
+        .await;
+
+        // Close connections before shutdown.
+        drop(client);
+        drop(backend);
+
+        harness.shutdown_assert_ok().await
+    }
+
+    /// With 2 active slots and 2 queue slots, the first two connections can transfer bytes
+    /// immediately, but the queued connection must wait for an active pair to close. The second in
+    /// the queue remains in the queue unconnected.
+    #[tokio::test(start_paused = true)]
+    async fn at_max_connections_queue_available_accepts_proxies_on_active_close() {
+        let config = default_config();
+        let mut harness = ProxyHarness::builder(config)
+            .max_connections(2)
+            .max_queue(2)
+            .start();
+
+        let (mut proxied_client_1, mut proxied_backend_1) = harness.proxied(PORT).await;
+        let (mut proxied_client_2, mut proxied_backend_2) = harness.proxied(PORT).await;
+        let (mut queued_client_1, mut queued_backend_1) = harness.proxied(PORT).await;
+        let (mut queued_client_2, mut queued_backend_2) = harness.proxied(PORT).await;
+
+        // Accepted connections proxy.
+        assert_proxied_bytes(
+            &mut proxied_client_1,
+            &mut proxied_backend_1,
+            b"request",
+            START_PAUSED_ASSERT_WAIT,
+        )
+        .await;
+        assert_proxied_bytes(
+            &mut proxied_backend_1,
+            &mut proxied_client_1,
+            b"response",
+            START_PAUSED_ASSERT_WAIT,
+        )
+        .await;
+        assert_proxied_bytes(
+            &mut proxied_client_2,
+            &mut proxied_backend_2,
+            b"request",
+            START_PAUSED_ASSERT_WAIT,
+        )
+        .await;
+        assert_proxied_bytes(
+            &mut proxied_backend_2,
+            &mut proxied_client_2,
+            b"response",
+            START_PAUSED_ASSERT_WAIT,
+        )
+        .await;
+
+        // Queued connections are open but do not proxy.
+        let queue_bytes = b"queue1";
+        assert_connection_open_idle(&mut queued_client_1, START_PAUSED_ASSERT_WAIT).await;
+        assert_no_proxied_bytes(
+            &mut queued_client_1,
+            &mut queued_backend_1,
+            queue_bytes,
+            START_PAUSED_ASSERT_WAIT,
+        )
+        .await;
+        assert_connection_open_idle(&mut queued_client_2, START_PAUSED_ASSERT_WAIT).await;
+        assert_no_proxied_bytes(
+            &mut queued_client_2,
+            &mut queued_backend_2,
+            b"queue2",
+            START_PAUSED_ASSERT_WAIT,
+        )
+        .await;
+
+        // Close an active connection
+        drop(proxied_client_1);
+        drop(proxied_backend_1);
+
+        // Next in the queue was accepted and tx from above is read and proxies.
+        assert_read_bytes(&mut queued_backend_1, queue_bytes, START_PAUSED_ASSERT_WAIT).await;
+
+        // Second in the queue still queued
+        assert_connection_open_idle(&mut queued_client_2, START_PAUSED_ASSERT_WAIT).await;
+        assert_no_proxied_bytes(
+            &mut queued_client_2,
+            &mut queued_backend_2,
+            b"queue2",
+            START_PAUSED_ASSERT_WAIT,
+        )
+        .await;
+
+        drop(proxied_client_2);
+        drop(proxied_backend_2);
+        drop(queued_client_1);
+        drop(queued_backend_1);
+        drop(queued_client_2);
+        drop(queued_backend_2);
+
+        harness.shutdown_assert_ok().await
+    }
+
+    /// With 2 active slots and 1 queue slot, the first two connections can transfer bytes
+    /// immediately, the third is queued, and the fourth is dropped
+    #[tokio::test(start_paused = true)]
+    async fn at_max_connections_max_queue_drops_for_too_many_connections() {
+        let config = default_config();
+        let mut harness = ProxyHarness::builder(config)
+            .max_connections(2)
+            .max_queue(1)
+            .start();
+
+        let (mut proxied_client_1, mut proxied_backend_1) = harness.proxied(PORT).await;
+        let (mut proxied_client_2, mut proxied_backend_2) = harness.proxied(PORT).await;
+        let (mut queued_client_1, mut queued_backend_1) = harness.proxied(PORT).await;
+        let mut dropped_client = harness.no_backend(PORT).await;
+
+        // Accepted connections proxy.
+        assert_proxied_bytes(
+            &mut proxied_client_1,
+            &mut proxied_backend_1,
+            b"request",
+            START_PAUSED_ASSERT_WAIT,
+        )
+        .await;
+        assert_proxied_bytes(
+            &mut proxied_backend_1,
+            &mut proxied_client_1,
+            b"response",
+            START_PAUSED_ASSERT_WAIT,
+        )
+        .await;
+        assert_proxied_bytes(
+            &mut proxied_client_2,
+            &mut proxied_backend_2,
+            b"request",
+            START_PAUSED_ASSERT_WAIT,
+        )
+        .await;
+        assert_proxied_bytes(
+            &mut proxied_backend_2,
+            &mut proxied_client_2,
+            b"response",
+            START_PAUSED_ASSERT_WAIT,
+        )
+        .await;
+
+        // Queued connection is open but does not proxy.
+        let queue_bytes = b"queue1";
+        assert_connection_open_idle(&mut queued_client_1, START_PAUSED_ASSERT_WAIT).await;
+        assert_no_proxied_bytes(
+            &mut queued_client_1,
+            &mut queued_backend_1,
+            queue_bytes,
+            START_PAUSED_ASSERT_WAIT,
+        )
+        .await;
+
+        // Latest connection is dropped
+        assert_connection_closed(&mut dropped_client, START_PAUSED_ASSERT_WAIT).await;
+
+        drop(proxied_client_1);
+        drop(proxied_backend_1);
+        drop(proxied_client_2);
+        drop(proxied_backend_2);
+        drop(queued_client_1);
+        drop(queued_backend_1);
+        drop(dropped_client);
+
+        harness.shutdown_assert_ok().await
+    }
+
     // connect_backend fails, logs and allows new connections
     // connection task panics, logs and continues
     // shutdown with open connections, clean drain
@@ -340,6 +548,7 @@ mod tests {
     // listener tasks panics, proxy tears down
     // test connections can half close properly
 
+    const START_PAUSED_ASSERT_WAIT: Duration = Duration::from_secs(1);
     const PORT: u16 = 8080;
 
     fn default_config() -> ProxyConfig {
@@ -357,14 +566,60 @@ mod tests {
         source: &mut DuplexStream,
         dest: &mut DuplexStream,
         bytes: &[u8; N],
+        wait: Duration,
     ) {
         source.write_all(bytes).await.expect("successful write");
+        assert_read_bytes(dest, bytes, wait).await;
+    }
+
+    async fn assert_read_bytes<const N: usize>(
+        conn: &mut DuplexStream,
+        bytes: &[u8; N],
+        wait: Duration,
+    ) {
         let mut from_source = [0u8; N];
-        timeout(Duration::from_secs(5), dest.read_exact(&mut from_source))
+        timeout(wait, conn.read_exact(&mut from_source))
             .await
             .expect("read shouldn't time out. check for misaligned streams in the harness")
             .expect("successful read");
         assert_eq!(&from_source, bytes);
+    }
+
+    /// This depends on a timeout and will be flakey if the test writer isn't careful. Most useful
+    /// in `start_paused`.
+    async fn assert_no_proxied_bytes<const N: usize>(
+        source: &mut DuplexStream,
+        dest: &mut DuplexStream,
+        bytes: &[u8; N],
+        wait: Duration,
+    ) {
+        source.write_all(bytes).await.expect("successful write");
+        let mut from_source = [0u8; N];
+        match timeout(wait, dest.read_exact(&mut from_source)).await {
+            Err(_timeout) => {}
+            _ => panic!("Expected attempt to proxy bytes to timeout, but it didn't"),
+        }
+    }
+
+    async fn assert_connection_closed(conn: &mut DuplexStream, wait: Duration) {
+        let buf: &mut [u8] = &mut [0u8; 4];
+        match timeout(wait, conn.read(buf)).await {
+            Ok(Ok(0)) => {}
+            Ok(any) => panic!("expected disconnectioned stream but read returned: {any:?}"),
+            Err(e) => panic!("expected disconnected stream but still awaiting writes: {e}"),
+        }
+    }
+
+    /// Note that this isn't great, it requires that there are no pending bytes to be read on the
+    /// existing connection and it chews up 50ms (if not running `start_paused`) of latency to check
+    /// something a peekable stream would be able to see immediately. Most useful in `start_paused`
+    async fn assert_connection_open_idle(conn: &mut DuplexStream, wait: Duration) {
+        let buf: &mut [u8] = &mut [0u8; 4];
+        match timeout(wait, conn.read(buf)).await {
+            Err(_timeout) => {}
+            Ok(Ok(_)) => panic!("expected idle open stream but found bytes"),
+            Ok(Err(e)) => panic!("expected idle open stream but got: {e}"),
+        }
     }
 
     mod harness {
@@ -522,6 +777,7 @@ mod tests {
             }
 
             async fn await_ack(ack: oneshot::Receiver<()>) {
+                // TODO: put this timeout in config
                 timeout(Duration::from_secs(5), ack)
                     .await
                     .expect("ack should not time out")

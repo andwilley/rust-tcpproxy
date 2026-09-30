@@ -23,6 +23,8 @@ We use hickory rather than OS DNS resolution. This gets us caching, but misses s
 
 We limit number of connections and queue size via flags strictly as a way to control total memory usage. This could be made more fair by enforcing per port quotas, but that seems fraught with assumptions about which traffic is critical for the client. We could also strictly bound the queue wait time to avoid long delays by waiting in the queue, but for now this can be tuned via the relative sizes of max connections.
 
+As is this means that we actively pull new connections off the network queue and drop them. This was deliberately chosen over letting them sit. A prompt closure allows the client to make better decisions than a vague increase in latency, where they can't be sure of the cause. The limited queue in the proxy makes the proportion of traffic that gets this treatment tunable and for the rest their attempts are promptly dropped.
+
 ### Datastructure for backend status
 
 We need some way to keep track of backend state. This will be checked for every connection and shared across tasks, so we should consider what the right tradeoffs should be based on expected and potentially worst case performance. In the normal operating case, I expect for the need to update these backend statuses to be rare. In most cases they'll be up, and if not we should mark them and potentially monitor them for cool down. In a pathological case where all backends or most are failing, the latency induced by trying these backends probably outweighs some of the more nuanced performance downsides of our chosen concurrency solution.
