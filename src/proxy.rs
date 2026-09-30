@@ -461,6 +461,15 @@ mod tests {
         )
         .await;
 
+        // Second active connection can still proxy.
+        assert_proxied_bytes(
+            &mut proxied_client_2,
+            &mut proxied_backend_2,
+            b"request",
+            START_PAUSED_ASSERT_WAIT,
+        )
+        .await;
+
         drop(proxied_client_2);
         drop(proxied_backend_2);
         drop(queued_client_1);
