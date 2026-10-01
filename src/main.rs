@@ -52,6 +52,11 @@ struct Args {
     /// Local address to bind.
     #[arg(long, default_value_t = IpAddr::V6(Ipv6Addr::UNSPECIFIED))]
     bind: IpAddr,
+
+    /// Bidirectional transfer/copy buffer size. Defaults to 8 KiB. Use this in conjunction with
+    /// max_connections and max_queue to manage memory ceiling.
+    #[arg(long, default_value_t = 8 * 1024)]
+    copy_buffer_size: usize,
 }
 
 async fn shutdown_signal(cancel_token: CancellationToken) {
@@ -96,6 +101,7 @@ async fn run() -> Result<(), ProxyError> {
         args.max_connections,
         args.max_queue,
         args.bind,
+        args.copy_buffer_size,
     )
     .run()
     .await?;

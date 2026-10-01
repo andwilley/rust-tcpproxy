@@ -21,6 +21,7 @@ pub struct ProxyServer<L, B> {
     open_connections: Arc<Semaphore>,
     queued_connections: Arc<Semaphore>,
     bind_addr: IpAddr,
+    copy_buf_size: usize,
 }
 
 impl<L, B> ProxyServer<L, B>
@@ -28,6 +29,7 @@ where
     L: StreamListenerFactory + 'static,
     B: LoadBalancer + 'static,
 {
+    // TODO: use a builder or a structured object to reduce args.
     pub fn new(
         listener_factory: L,
         balancer: B,
@@ -36,6 +38,7 @@ where
         max_connections: usize,
         max_queue: usize,
         bind_addr: IpAddr,
+        copy_buf_size: usize,
     ) -> Self {
         Self {
             listener_factory,
@@ -45,6 +48,7 @@ where
             open_connections: Arc::new(Semaphore::const_new(max_connections)),
             queued_connections: Arc::new(Semaphore::const_new(max_queue)),
             bind_addr,
+            copy_buf_size,
         }
     }
 
@@ -68,6 +72,7 @@ where
                 self.open_connections.clone(),
                 self.queued_connections.clone(),
                 self.cancel_token.clone(),
+                self.copy_buf_size,
             ));
         }
         let mut first_error: Option<ProxyError> = None;
@@ -104,6 +109,7 @@ async fn listen<L, B>(
     open_connections: Arc<Semaphore>,
     queued_connections: Arc<Semaphore>,
     cancel_token: CancellationToken,
+    copy_buf_size: usize,
 ) -> Result<(), ProxyError>
 where
     L: StreamListener + 'static,
@@ -129,7 +135,8 @@ where
                     balancer.clone(),
                     open_connections.clone(),
                     queued_connections.clone(),
-                    &mut connections
+                    &mut connections,
+                    copy_buf_size,
                 ) {
                     // Try the next connection.
                     AcceptResult::Connected |
@@ -181,6 +188,7 @@ fn accept_connection<B, S>(
     open_connections: Arc<Semaphore>,
     queued_connections: Arc<Semaphore>,
     connections: &mut JoinSet<()>,
+    copy_buf_size: usize,
 ) -> AcceptResult
 where
     B: LoadBalancer + 'static,
@@ -207,7 +215,7 @@ where
     if let Ok(permit) = open_connections.clone().try_acquire_owned() {
         connections.spawn(async move {
             let _permit = permit;
-            if let Err(e) = do_connection(port, in_sock, new_balancer).await {
+            if let Err(e) = do_connection(port, in_sock, new_balancer, copy_buf_size).await {
                 error!(port, err = %e, "Connection to backends failed")
             }
         });
@@ -221,7 +229,7 @@ where
                 return;
             };
             drop(queue_slot);
-            if let Err(e) = do_connection(port, in_sock, new_balancer).await {
+            if let Err(e) = do_connection(port, in_sock, new_balancer, copy_buf_size).await {
                 error!(port, err = %e, "Connection to backends failed")
             }
         });
@@ -231,13 +239,24 @@ where
     AcceptResult::RejectedTooManyConnections
 }
 
-async fn do_connection<S, B>(port: u16, mut in_sock: S, balancer: Arc<B>) -> Result<(), ProxyError>
+async fn do_connection<S, B>(
+    port: u16,
+    mut in_sock: S,
+    balancer: Arc<B>,
+    copy_buf_size: usize,
+) -> Result<(), ProxyError>
 where
     S: AsyncStream,
     B: LoadBalancer,
 {
     let (mut out_sock, _) = balancer.connect_backend(port).await?;
-    tokio::io::copy_bidirectional(&mut in_sock, &mut out_sock).await?;
+    tokio::io::copy_bidirectional_with_sizes(
+        &mut in_sock,
+        &mut out_sock,
+        copy_buf_size,
+        copy_buf_size,
+    )
+    .await?;
     Ok(())
 }
 
@@ -550,12 +569,77 @@ mod tests {
         harness.shutdown_assert_ok().await
     }
 
-    // connect_backend fails, logs and allows new connections
-    // connection task panics, logs and continues
-    // shutdown with open connections, clean drain
-    // shutdown with open connections, forces close after limit
-    // listener tasks panics, proxy tears down
-    // test connections can half close properly
+    #[tokio::test(start_paused = true)]
+    async fn backend_fails_proxy_continues() {
+        let config = default_config();
+        let connect_error = ProxyError::IoError(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "connect error",
+        ));
+        let mut harness = ProxyHarness::builder(config).start();
+        let mut client_1 = harness.backend_connect_fail(PORT, connect_error).await;
+        let (mut client_2, mut backend_2) = harness.proxied(PORT).await;
+
+        assert_connection_closed(&mut client_1, START_PAUSED_ASSERT_WAIT).await;
+        assert_proxied_bytes(
+            &mut client_2,
+            &mut backend_2,
+            b"request",
+            START_PAUSED_ASSERT_WAIT,
+        )
+        .await;
+        assert_proxied_bytes(
+            &mut backend_2,
+            &mut client_2,
+            b"response",
+            START_PAUSED_ASSERT_WAIT,
+        )
+        .await;
+
+        // Close connections before shutdown.
+        drop(client_1);
+        drop(client_2);
+        drop(backend_2);
+
+        harness.shutdown_assert_ok().await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connections_half_close_properly() {
+        let config = default_config();
+        let mut harness = ProxyHarness::builder(config).start();
+        let (mut client, mut backend) = harness.proxied(PORT).await;
+
+        // Client writes and closes its write-half
+        client
+            .write_all(b"request")
+            .await
+            .expect("successful write");
+        client.shutdown().await.expect("successful shutdown");
+
+        // Those bytes arrive, client->backend closes, and more can be sent back.
+        assert_read_bytes(&mut backend, b"request", START_PAUSED_ASSERT_WAIT).await;
+        assert_connection_closed(&mut backend, START_PAUSED_ASSERT_WAIT).await;
+        assert_proxied_bytes(
+            &mut backend,
+            &mut client,
+            b"response",
+            START_PAUSED_ASSERT_WAIT,
+        )
+        .await;
+
+        // Close connections before shutdown.
+        drop(client);
+        drop(backend);
+
+        harness.shutdown_assert_ok().await
+    }
+
+    // TODO: tests once we have better assertions:
+    // - shutdown with open connections, clean drain
+    // - shutdown with open connections, forces close after limit
+    // - connection task panics, logs and continues
+    // - listener tasks panics, proxy tears down
 
     const START_PAUSED_ASSERT_WAIT: Duration = Duration::from_secs(1);
     const PORT: u16 = 8080;
@@ -837,6 +921,7 @@ mod tests {
                     self.max_connections,
                     self.max_queue,
                     IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                    1024 * 8, // copy_buf_size
                 );
                 let task = tokio::spawn(proxy.run());
                 ProxyHarness {
