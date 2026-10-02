@@ -6,7 +6,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 pub trait AsyncStream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> AsyncStream for T {}
 
-pub trait StreamListenerFactory: Send + Sync + Clone {
+pub trait StreamListenerFactory: Send + Sync + Clone + 'static {
     type Listener: StreamListener;
     fn bind(
         &self,
@@ -14,7 +14,7 @@ pub trait StreamListenerFactory: Send + Sync + Clone {
     ) -> impl Future<Output = Result<Self::Listener, ProxyError>> + Send;
 }
 
-pub trait StreamListener: Send + Sync {
+pub trait StreamListener: Send + Sync + 'static {
     type Stream: AsyncStream;
 
     /// This needs to be cancel safe. Accept may be cancelled in-flight by the select it runs in

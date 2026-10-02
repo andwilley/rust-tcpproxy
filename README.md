@@ -29,7 +29,7 @@ As is this means that we actively pull new connections off the network queue and
 
 We need some way to keep track of backend state. This will be checked for every connection and shared across tasks, so we should consider what the right tradeoffs should be based on expected and potentially worst case performance. In the normal operating case, I expect for the need to update these backend statuses to be rare. In most cases they'll be up, and if not we should mark them and potentially monitor them for cool down. In a pathological case where all backends or most are failing, the latency induced by trying these backends probably outweighs some of the more nuanced performance downsides of our chosen concurrency solution.
 
-The data model was designed to support this "minimal mutation required" approach. We have a 2 value enum to represent 3 states. A backend is either serving traffic, cooling down, or drained. To represent cooldown we use a simple `Instant`, where if that is in the future, the backend is still cooling down. Once this cooldown expires it doesn't need to be updated. There are cases where we'll try to connect to cooling backends and if successful, we do remove the cooldown, but typically this shouldn't be necessary. This should make an assumption that we are almost always reading and very rarely writing a valid one.
+The data model was designed to support this "minimal mutation required" approach. We have a 2 value enum to represent 3 states. A backend is either serving traffic, cooling down, or drained. To represent cooldown we use a simple `Instant`, where if that is in the future, the backend is still cooling down. Once this cooldown expires it doesn't need to be updated. There are cases where we'll try to connect to cooling backends and if successful, we do remove the cooldown, but typically this shouldn't be necessary. This should make an assumption that we are almost always reading and very rarely writing a valid one. If we need more granular partial cooldowns we may need to add to this model.
 
 A mutex per backend would be safe, but would increase contention for reads, and rwlocks typically don't fare much better. Even though critical sections are short, both serve to put a kind of ceiling on concurrency which can be roughly translated to throughput of the proxy.
 
@@ -40,6 +40,12 @@ ArcSwap allows us to optimize for the read path without dealing with the cache b
 ### Cooldown handling is intentionally loose
 
 We don't require that we get 100% consistency. The cooldown state of a backend can be stepped on by another attempt that had success, e.g. This is generally fine. Handling that would require much more concurrency control, more blocking and contention, etc. If one task could connect and the other couldn't, they're probably both right at some level.
+
+Things we should do that we don't yet:
+
+- Vary the cooldown by the failure type. NxDomain is much different from connection refused, e.g.
+- Track connection latency. If latency climbs for a target, start a full or partial cooldown.
+- Implement partial cooldown. The all or nothing switch we currently have is coarse and will have the effect of slamming healthy backends until they refuse to connect. All gas or all brake (See backend drain below).
 
 ### Generics over dynamic dispatch
 
@@ -80,7 +86,9 @@ TODO
 
 - [ ] In Progress: Testing
   - [x] Mock traits for testing
-  - [ ] Unit tests [in progress]
+  - [x] Proxy logic unit tests
+  - [ ] Round robin fakes and unit tests [In progress]
+  - [ ] Simple cooldown unit tests
   - [ ] Manual end-to-end test with fake backends
   - [ ] Load tests, performance benchmarks
 - [ ] Next: Metrics/telemetry

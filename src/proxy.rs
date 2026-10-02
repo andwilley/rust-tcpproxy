@@ -26,8 +26,8 @@ pub struct ProxyServer<L, B> {
 
 impl<L, B> ProxyServer<L, B>
 where
-    L: StreamListenerFactory + 'static,
-    B: LoadBalancer + 'static,
+    L: StreamListenerFactory,
+    B: LoadBalancer,
 {
     // TODO: use a builder or a structured object to reduce args.
     pub fn new(
@@ -112,8 +112,8 @@ async fn listen<L, B>(
     copy_buf_size: usize,
 ) -> Result<(), ProxyError>
 where
-    L: StreamListener + 'static,
-    B: LoadBalancer + 'static,
+    L: StreamListener,
+    B: LoadBalancer,
 {
     let mut connections = JoinSet::new();
 
@@ -191,7 +191,7 @@ fn accept_connection<B, S>(
     copy_buf_size: usize,
 ) -> AcceptResult
 where
-    B: LoadBalancer + 'static,
+    B: LoadBalancer,
     S: AsyncStream,
 {
     let (in_sock, _source_addr) = match accept_result {
@@ -262,18 +262,14 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::balancer::fakes::{ConnectCommand, FakeLoadBalancer};
+    use std::time::Duration;
+
     use crate::config::{App, RawConfig};
-    use crate::network::fakes::{AcceptCommand, FakeListenerFactory};
-    use harness::ProxyHarness;
-    use std::collections::HashMap;
-    use std::net::Ipv6Addr;
+    use crate::proxyharness::ProxyHarness;
+    use crate::proxy::ProxyError;
+    use crate::state::ProxyConfig;
+    use tokio::io::AsyncWriteExt;
     use tokio::io::{AsyncReadExt, DuplexStream};
-    use tokio::io::{AsyncWriteExt, duplex};
-    use tokio::sync::mpsc::UnboundedSender;
-    use tokio::sync::oneshot;
-    use tokio::task::JoinHandle;
     use tokio::time::timeout;
 
     #[tokio::test(start_paused = true)]
@@ -712,228 +708,6 @@ mod tests {
             Err(_timeout) => {}
             Ok(Ok(_)) => panic!("expected idle open stream but found bytes"),
             Ok(Err(e)) => panic!("expected idle open stream but got: {e}"),
-        }
-    }
-
-    mod harness {
-        use super::*;
-
-        /// Manages the running proxy and exposes connections and control. This is only works for a
-        /// single threaded test, which is fine for some of the mechanics and good for determinism,
-        /// but these are insufficient to cover the concurrent surface area. Integration tests are
-        /// needed.
-        ///
-        /// TODO:
-        /// - add "unexpected warn+ logs throw" and "unreceived expected logs throw"
-        /// - impl Drop to ensure that the proxy task is cancelled properly
-        /// - We may need better detection of stream mis-alignment (see no_backend).
-        pub struct ProxyHarness {
-            cancel_token: CancellationToken,
-            task: JoinHandle<Result<(), ProxyError>>,
-            accept_commands: HashMap<u16, UnboundedSender<AcceptCommand>>,
-            connect_commands: HashMap<u16, UnboundedSender<ConnectCommand>>,
-            duplex_buf_size: usize,
-            client_ctr: usize,
-            backend_ctr: usize,
-        }
-
-        impl ProxyHarness {
-            pub fn builder(config: ProxyConfig) -> ProxyHarnessBuilder {
-                ProxyHarnessBuilder {
-                    config,
-                    max_connections: 10,
-                    max_queue: 10,
-                    duplex_buf_size: 1024 * 64,
-                    bind_failures: HashMap::new(),
-                }
-            }
-
-            /// Returns a connected (client, backend) streams.
-            pub async fn proxied(&mut self, port: u16) -> (DuplexStream, DuplexStream) {
-                let (test_side_client, proxy_side_client) = duplex(self.duplex_buf_size);
-                let (test_side_backend, proxy_side_backend) = duplex(self.duplex_buf_size);
-                let (ack_tx, ack_rx) = oneshot::channel();
-                let backend_sock = self.next_backend_sock();
-                Self::send_command(
-                    &self.connect_commands,
-                    port,
-                    Ok((proxy_side_backend, backend_sock)),
-                );
-                let client_sock = self.next_client_sock();
-                Self::send_command(
-                    &self.accept_commands,
-                    port,
-                    (Ok((proxy_side_client, client_sock)), ack_tx),
-                );
-                Self::await_ack(ack_rx).await;
-                (test_side_client, test_side_backend)
-            }
-
-            /// Client connection fails at accept with the provided error. No connections.
-            pub async fn accept_fail(&mut self, port: u16, e: ProxyError) {
-                let (ack_tx, ack_rx) = oneshot::channel();
-                Self::send_command(&self.accept_commands, port, (Err(e), ack_tx));
-                Self::await_ack(ack_rx).await;
-            }
-
-            /// Returns the client side of a connection, there will be no backend side.
-            pub async fn backend_connect_fail(&mut self, port: u16, e: ProxyError) -> DuplexStream {
-                let (test_side_client, proxy_side_client) = duplex(self.duplex_buf_size);
-                let client_sock = self.next_client_sock();
-                let (ack_tx, ack_rx) = oneshot::channel();
-                Self::send_command(&self.connect_commands, port, Err(e));
-                Self::send_command(
-                    &self.accept_commands,
-                    port,
-                    (Ok((proxy_side_client, client_sock)), ack_tx),
-                );
-                Self::await_ack(ack_rx).await;
-                test_side_client
-            }
-
-            /// No error in accept or connect, accept runs, but no connection is expected, e.g. too many
-            /// connections.
-            pub async fn no_backend(&mut self, port: u16) -> DuplexStream {
-                let (test_side_client, proxy_side_client) = duplex(self.duplex_buf_size);
-                let client_sock = self.next_client_sock();
-                let (ack_tx, ack_rx) = oneshot::channel();
-                Self::send_command(
-                    &self.accept_commands,
-                    port,
-                    (Ok((proxy_side_client, client_sock)), ack_tx),
-                );
-                Self::await_ack(ack_rx).await;
-                test_side_client
-            }
-
-            /// Waits for the proxy to finish, propogating panics.
-            pub async fn join(self) -> Result<(), ProxyError> {
-                match self.task.await {
-                    Ok(res) => res,
-                    Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-                    Err(e) => panic!("proxy task cancelled: {e}"),
-                }
-            }
-
-            /// Tear down the proxy. Does not close connections. You must await the task via
-            /// ProxyHarness::join().
-            pub fn cancel(&self) {
-                self.cancel_token.cancel();
-            }
-
-            /// Tears down the proxy. Does not close open connections. If connections remain open,
-            /// the shutdown drain will run and drop them at the timeout.
-            pub async fn shutdown(self) -> Result<(), ProxyError> {
-                self.cancel();
-                self.join().await
-            }
-
-            /// Tears down the proxy, expects a clean shutdown.
-            pub async fn shutdown_assert_ok(self) {
-                match self.shutdown().await {
-                    Ok(()) => {}
-                    Err(e) => panic!("expected OK on shutdown but got: {e}"),
-                }
-            }
-
-            fn send_command<V>(
-                channel_map: &HashMap<u16, UnboundedSender<V>>,
-                port: u16,
-                result: V,
-            ) {
-                channel_map
-                    .get(&port)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "expected command channel to exist for port {port}: no command \
-                            channel — not in config, or bind_fail was set"
-                        )
-                    })
-                    .send(result)
-                    .expect("successful send");
-            }
-
-            fn next_client_sock(&mut self) -> SocketAddr {
-                let sock = format!("127.0.0.1:{}", 40000 + self.client_ctr)
-                    .parse()
-                    .expect("valid upstream address");
-                self.client_ctr += 1;
-                sock
-            }
-
-            fn next_backend_sock(&mut self) -> SocketAddr {
-                let sock = format!("127.0.0.1:{}", 9000 + self.backend_ctr)
-                    .parse()
-                    .expect("valid downstream address");
-                self.backend_ctr += 1;
-                sock
-            }
-
-            async fn await_ack(ack: oneshot::Receiver<()>) {
-                // TODO: put this timeout in config
-                timeout(Duration::from_secs(5), ack)
-                    .await
-                    .expect("ack should not time out")
-                    .expect("acked");
-            }
-        }
-
-        pub struct ProxyHarnessBuilder {
-            config: ProxyConfig,
-            max_connections: usize,
-            max_queue: usize,
-            bind_failures: HashMap<u16, ProxyError>,
-            duplex_buf_size: usize,
-        }
-
-        impl ProxyHarnessBuilder {
-            pub fn bind_fail(mut self, port: u16, e: ProxyError) -> Self {
-                self.bind_failures.insert(port, e);
-                self
-            }
-
-            pub fn max_connections(mut self, conns: usize) -> Self {
-                self.max_connections = conns;
-                self
-            }
-
-            pub fn max_queue(mut self, conns: usize) -> Self {
-                self.max_queue = conns;
-                self
-            }
-
-            #[expect(dead_code)]
-            pub fn duplex_buf_size(mut self, size: usize) -> Self {
-                self.duplex_buf_size = size;
-                self
-            }
-
-            pub fn start(self) -> ProxyHarness {
-                let (listener_factory, accept_commands) =
-                    FakeListenerFactory::new(&self.config, self.bind_failures);
-                let (balancer, connect_commands) = FakeLoadBalancer::new(&self.config);
-                let cancel_token = CancellationToken::new();
-                let proxy = ProxyServer::new(
-                    listener_factory,
-                    balancer,
-                    Arc::new(self.config),
-                    cancel_token.clone(),
-                    self.max_connections,
-                    self.max_queue,
-                    IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-                    1024 * 8, // copy_buf_size
-                );
-                let task = tokio::spawn(proxy.run());
-                ProxyHarness {
-                    cancel_token,
-                    task,
-                    accept_commands,
-                    connect_commands,
-                    duplex_buf_size: self.duplex_buf_size,
-                    client_ctr: 0,
-                    backend_ctr: 0,
-                }
-            }
         }
     }
 }

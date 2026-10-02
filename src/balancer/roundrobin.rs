@@ -75,7 +75,7 @@ where
             }
         };
 
-        let mut cooling: Vec<(Instant, &str)> = Vec::new();
+        let mut cooling: Vec<&str> = Vec::new();
         for i in 0..backends.len() {
             let target = &backends[(start_idx + i) % backends.len()];
             let target_status = self.cooldown.get_target_status(target)?;
@@ -84,7 +84,7 @@ where
                 BackendStatus::Alive {
                     cool_until: Some(time),
                 } if time > Instant::now() => {
-                    cooling.push((time, target));
+                    cooling.push(target);
                     continue;
                 }
                 _ => {}
@@ -96,9 +96,8 @@ where
             };
         }
 
-        // Since we failed to connect, try the cooling targets.
-        cooling.sort(); // By cool_until ascending.
-        for (_, target) in cooling {
+        // Since we failed to connect, try the cooling targets in RR order.
+        for target in cooling {
             match self.connect(target, for_port).await {
                 ConnectAttempt::Ready(s) => return Ok(s),
                 ConnectAttempt::TryNext => continue,
@@ -154,10 +153,7 @@ where
         for sock_addr in sock_addrs {
             match timeout(Self::CONNECT_TIMEOUT, self.connector.connect(sock_addr)).await {
                 Ok(Ok(stream)) => {
-                    match self.cooldown.report_connection_attempt(target, Success) {
-                        Ok(_) => {}
-                        Err(e) => return ConnectAttempt::Fatal(e),
-                    };
+                    let _ = self.cooldown.report_connection_attempt(target, Success);
                     return ConnectAttempt::Ready((stream, sock_addr));
                 }
                 Ok(Err(e)) => {
@@ -185,4 +181,58 @@ where
         let _ = self.cooldown.report_connection_attempt(target, Failure);
         ConnectAttempt::TryNext
     }
+}
+
+#[cfg(test)]
+mod tests {
+    /*
+    - tests for config validation with malformed configs
+    - everything else should be scripted by individual backend behavior in order of their defintions
+      in the config
+
+    A backend can be "good" OR one of these
+    - cooling down (skipped and potentially retried)
+    - fails to resolve for some proxy error
+    - fails to connect with some proxy error
+    - times out connecting
+
+    We should be able to define behavior for every backend and verify it happens in order. A quick
+    builder for the RR balancer that takes a config and a script per port for backends with the
+    states above and exoses the vec of cooldown reports.
+
+    Fakes set up before each test based on the script:
+
+    We need a shared events vec where these fakes record their actions so we see them all the time
+    in order so we can verify things like "skipped for cooling" in the correct order. Cooldown fake
+    should let us say which backends are already cooling, and expose which new ones were reported in
+    order Resolver fake will be a simple one set up at test time fail resolve with any of the
+    scripted backends. Connect fake will either return a duplexstream or the scripted error
+
+    Fake cooldown:
+    - follows the script from the builder
+    - records calls to record in our events list
+
+    Fake Connector:
+    - Follows the script from the builder
+    - records connection attempts in the events list
+
+    Fake Resolver:
+    - Follows the script
+    - records the resolve attempts in the events list
+
+    RR Harness:
+    - provides a builder that takes a config
+    - per port scripts backend behavior as above
+    - expose events list for assertions
+    - use socketaddr details to assert on the returned connection
+
+    Example tests:
+    - no targets -> fail
+    - empty backends -> fail
+    - 5 backends, all backends drained -> fail
+    - 5 backends, 5 connect in config order.
+    - 5 backends, 4 cooling, 5th connects
+    - 5 backends, all cooling, 5 connections connect in RR order
+    - 2 backends, 1 conn fail, 1 cooling, connects to the cooling backend
+    */
 }
