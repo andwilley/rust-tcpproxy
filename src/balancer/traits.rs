@@ -13,7 +13,7 @@ pub trait LoadBalancer: Send + Sync + 'static {
     ) -> impl Future<Output = Result<(Self::Stream, SocketAddr), ProxyError>> + Send;
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Eq, Debug, Clone)]
 pub enum ConnectResult {
     Success,
     Failure,

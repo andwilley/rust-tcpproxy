@@ -56,6 +56,7 @@ impl TargetState {
 }
 
 impl ProxyConfig {
+    /// Get the set of backends for a given port.
     pub fn get_pool(&self, port: u16) -> Option<&[String]> {
         let idx = *self.port_to_pool.get(&port)?;
         self.target_pools.get(idx).map(|target| target.as_slice())

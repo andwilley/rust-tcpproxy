@@ -193,11 +193,6 @@ impl ProxyHarnessBuilder {
         self
     }
 
-    pub fn duplex_buf_size(mut self, size: usize) -> Self {
-        self.duplex_buf_size = size;
-        self
-    }
-
     pub fn start(self) -> ProxyHarness {
         let (listener_factory, accept_commands) =
             fakes::FakeListenerFactory::new(&self.config, self.bind_failures);

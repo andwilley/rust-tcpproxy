@@ -14,6 +14,7 @@ use std::time::Instant;
 use tokio::time::timeout;
 use tracing::{error, warn};
 
+#[derive(Debug)]
 pub struct RoundRobinBalancer<R, C, B> {
     config: Arc<ProxyConfig>,
     port_to_rr_counter: HashMap<u16, AtomicUsize>,
@@ -185,54 +186,265 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::{
+        balancer::roundrobinharness::{
+            ConnectedBackendData, RoundRobinHarness,
+            fakes::{
+                BackendBehavior,
+                TestEvent::{GotCooldownStatus, ResolveAttempted},
+            },
+        },
+        config::{App, RawConfig},
+        state::ProxyConfig,
+    };
+    use std::{
+        collections::HashMap,
+        time::{Duration, Instant},
+    };
+
+    #[tokio::test(start_paused = true)]
+    async fn backends_connect_in_order() {
+        let mut behaviors = HashMap::new();
+        behaviors.insert(
+            BACKEND_0.to_string(),
+            vec![BackendBehavior::ConnectSuccess {
+                cooldown: None,
+                bad_socket_cnt: 0,
+            }],
+        );
+        behaviors.insert(
+            BACKEND_1.to_string(),
+            vec![BackendBehavior::ConnectSuccess {
+                cooldown: None,
+                bad_socket_cnt: 0,
+            }],
+        );
+        behaviors.insert(
+            BACKEND_2.to_string(),
+            vec![BackendBehavior::ConnectSuccess {
+                cooldown: None,
+                bad_socket_cnt: 0,
+            }],
+        );
+        behaviors.insert(
+            BACKEND_3.to_string(),
+            vec![BackendBehavior::ConnectSuccess {
+                cooldown: None,
+                bad_socket_cnt: 0,
+            }],
+        );
+        behaviors.insert(
+            BACKEND_4.to_string(),
+            vec![BackendBehavior::ConnectSuccess {
+                cooldown: None,
+                bad_socket_cnt: 0,
+            }],
+        );
+        let harness = RoundRobinHarness::new(
+            default_config(vec![
+                BACKEND_0.to_string(),
+                BACKEND_1.to_string(),
+                BACKEND_2.to_string(),
+                BACKEND_3.to_string(),
+                BACKEND_4.to_string(),
+            ]),
+            behaviors,
+        );
+
+        let connection_0 = harness
+            .connect_backend(PORT)
+            .await
+            .expect("Should connect OK");
+        let connection_1 = harness
+            .connect_backend(PORT)
+            .await
+            .expect("Should connect OK");
+        let connection_2 = harness
+            .connect_backend(PORT)
+            .await
+            .expect("Should connect OK");
+        let connection_3 = harness
+            .connect_backend(PORT)
+            .await
+            .expect("Should connect OK");
+        let connection_4 = harness
+            .connect_backend(PORT)
+            .await
+            .expect("Should connect OK");
+
+        let expected_0 = ConnectedBackendData::with_defaults(0);
+        let expected_1 = ConnectedBackendData::with_defaults(1);
+        let expected_2 = ConnectedBackendData::with_defaults(2);
+        let expected_3 = ConnectedBackendData::with_defaults(3);
+        let expected_4 = ConnectedBackendData::with_defaults(4);
+        assert_eq!(connection_0, expected_0);
+        assert_eq!(connection_1, expected_1);
+        assert_eq!(connection_2, expected_2);
+        assert_eq!(connection_3, expected_3);
+        assert_eq!(connection_4, expected_4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cooling_backends_connects_first_alive_in_rr_order() {
+        let mut behaviors = HashMap::new();
+        let later = Instant::now() + Duration::from_mins(5);
+        behaviors.insert(
+            BACKEND_0.to_string(),
+            vec![BackendBehavior::CooldownSkip { cooldown: later }],
+        );
+        behaviors.insert(
+            BACKEND_1.to_string(),
+            vec![BackendBehavior::CooldownSkip { cooldown: later }],
+        );
+        behaviors.insert(
+            BACKEND_2.to_string(),
+            vec![BackendBehavior::ConnectSuccess {
+                cooldown: None,
+                bad_socket_cnt: 0,
+            }],
+        );
+        let harness = RoundRobinHarness::new(
+            default_config(vec![
+                BACKEND_0.to_string(),
+                BACKEND_1.to_string(),
+                BACKEND_2.to_string(),
+            ]),
+            behaviors,
+        );
+
+        // skips all cooling backends and connects to first alive
+        let connection = harness
+            .connect_backend(PORT)
+            .await
+            .expect("Should connect OK");
+
+        // behavior 1 is the connect, after the skip for cooling
+        let expected = ConnectedBackendData::with_defaults(2);
+        assert_eq!(connection, expected);
+        // Attempt results in skipping first 2 backends
+        let expected_first_events = vec![
+            GotCooldownStatus {
+                backend: BACKEND_0.to_string(),
+            },
+            GotCooldownStatus {
+                backend: BACKEND_1.to_string(),
+            },
+            GotCooldownStatus {
+                backend: BACKEND_2.to_string(),
+            },
+            ResolveAttempted {
+                host: BACKEND_2.to_string(),
+            },
+        ];
+        let actual_first_events = &harness.events()[..4];
+        assert_eq!(actual_first_events, expected_first_events);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cooling_backends_skip_then_connect_in_order() {
+        let mut behaviors = HashMap::new();
+        let later = Instant::now() + Duration::from_mins(5);
+        behaviors.insert(
+            BACKEND_0.to_string(),
+            vec![
+                BackendBehavior::CooldownSkip { cooldown: later },
+                BackendBehavior::ConnectSuccess {
+                    cooldown: Some(later),
+                    bad_socket_cnt: 0,
+                },
+            ],
+        );
+        behaviors.insert(
+            BACKEND_1.to_string(),
+            vec![
+                BackendBehavior::CooldownSkip { cooldown: later },
+                BackendBehavior::ConnectSuccess {
+                    cooldown: Some(later),
+                    bad_socket_cnt: 0,
+                },
+            ],
+        );
+        let harness = RoundRobinHarness::new(
+            default_config(vec![BACKEND_0.to_string(), BACKEND_1.to_string()]),
+            behaviors,
+        );
+
+        // each skips all backends and tries itself again in RR order.
+        let connection_0 = harness
+            .connect_backend(PORT)
+            .await
+            .expect("Should connect OK");
+        let connection_1 = harness
+            .connect_backend(PORT)
+            .await
+            .expect("Should connect OK");
+
+        // behavior 1 for each is the connect, after the skip for cooling
+        let expected_0 = ConnectedBackendData {
+            target_id: 0,
+            behavior_num: 1,
+            instance: 0,
+        };
+        let expected_1 = ConnectedBackendData {
+            target_id: 1,
+            behavior_num: 1,
+            instance: 0,
+        };
+        assert_eq!(connection_0, expected_0);
+        assert_eq!(connection_1, expected_1);
+        // Each attempt results in skipping each backend then retying in RR order.
+        let expected_first_connection_cooldowns = vec![
+            GotCooldownStatus {
+                backend: BACKEND_0.to_string(),
+            },
+            GotCooldownStatus {
+                backend: BACKEND_1.to_string(),
+            },
+        ];
+        let expected_second_connection_cooldowns = vec![
+            GotCooldownStatus {
+                backend: BACKEND_1.to_string(),
+            },
+            GotCooldownStatus {
+                backend: BACKEND_0.to_string(),
+            },
+        ];
+        let events = harness.events();
+        let actual_first_connection_cooldowns = &events[..2];
+        assert_eq!(
+            actual_first_connection_cooldowns,
+            expected_first_connection_cooldowns
+        );
+        // after first connection's resolve, connect, report events
+        let actual_second_connection_cooldowns = &events[5..7];
+        assert_eq!(
+            actual_second_connection_cooldowns,
+            expected_second_connection_cooldowns
+        );
+    }
+
+    const PORT: u16 = 8080;
+    const BACKEND_0: &str = "backend.example.com:0";
+    const BACKEND_1: &str = "backend.example.com:1";
+    const BACKEND_2: &str = "backend.example.com:2";
+    const BACKEND_3: &str = "backend.example.com:3";
+    const BACKEND_4: &str = "backend.example.com:4";
+
+    fn default_config(backends: Vec<String>) -> ProxyConfig {
+        ProxyConfig::try_from(&RawConfig {
+            apps: vec![App {
+                name: "test".to_string(),
+                ports: vec![PORT],
+                targets: backends,
+            }],
+        })
+        .expect("config")
+    }
     /*
-    - tests for config validation with malformed configs
-    - everything else should be scripted by individual backend behavior in order of their defintions
-      in the config
-
-    A backend can be "good" OR one of these
-    - cooling down (skipped and potentially retried)
-    - fails to resolve for some proxy error
-    - fails to connect with some proxy error
-    - times out connecting
-
-    We should be able to define behavior for every backend and verify it happens in order. A quick
-    builder for the RR balancer that takes a config and a script per port for backends with the
-    states above and exoses the vec of cooldown reports.
-
-    Fakes set up before each test based on the script:
-
-    We need a shared events vec where these fakes record their actions so we see them all the time
-    in order so we can verify things like "skipped for cooling" in the correct order. Cooldown fake
-    should let us say which backends are already cooling, and expose which new ones were reported in
-    order Resolver fake will be a simple one set up at test time fail resolve with any of the
-    scripted backends. Connect fake will either return a duplexstream or the scripted error
-
-    Fake cooldown:
-    - follows the script from the builder
-    - records calls to record in our events list
-
-    Fake Connector:
-    - Follows the script from the builder
-    - records connection attempts in the events list
-
-    Fake Resolver:
-    - Follows the script
-    - records the resolve attempts in the events list
-
-    RR Harness:
-    - provides a builder that takes a config
-    - per port scripts backend behavior as above
-    - expose events list for assertions
-    - use socketaddr details to assert on the returned connection
-
-    Example tests:
     - no targets -> fail
     - empty backends -> fail
     - 5 backends, all backends drained -> fail
-    - 5 backends, 5 connect in config order.
     - 5 backends, 4 cooling, 5th connects
-    - 5 backends, all cooling, 5 connections connect in RR order
     - 2 backends, 1 conn fail, 1 cooling, connects to the cooling backend
     */
 }

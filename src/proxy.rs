@@ -265,8 +265,8 @@ mod tests {
     use std::time::Duration;
 
     use crate::config::{App, RawConfig};
-    use crate::proxyharness::ProxyHarness;
     use crate::proxy::ProxyError;
+    use crate::proxyharness::ProxyHarness;
     use crate::state::ProxyConfig;
     use tokio::io::AsyncWriteExt;
     use tokio::io::{AsyncReadExt, DuplexStream};
