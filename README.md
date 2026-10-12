@@ -1,124 +1,290 @@
-[Work in Progress] TCP Proxy
-============================
+A simple TCP Proxy in async Rust
+================================
 
-A project designed to learn async Rust. Not intended for reuse.
+Round-robin across backends, cooldown on failure, bounded connection pool with
+a bounded queue. A project designed to learn async Rust. Not intended for
+reuse.
 
 ```sh
-cargo nextest run # more/better tests coming
+cargo nextest run
 cargo run -- --help
 ```
+
+Demo
+----
+
+Set up 3 terminals:
+
+```sh
+# terminal 1
+nc -l 9001
+
+# terminal 2
+cargo run -- --config config.json
+
+# terminal 3
+nc 127.0.0.1 5001
+```
+
+Type into the netcat terminals.
 
 Design decisions
 ----------------
 
-### Static JSON config
-
-This is simple and quick to get started with. The config shape is adapted from the Fly.io challenge (this project is not a submission for this challenge). Dynamic discovery of this mapping would be ideal.
-
 ### DNS resolution
 
-We use hickory rather than OS DNS resolution. This gets us caching, but misses still result in lookups during connection. Background lookups could improve performance as long as it doesn't compete with connections. A task to refresh resolution at TTLs could be first step.
+We use hickory rather than OS DNS resolution. This gets us caching, but misses
+still result in lookups during connection. Background lookups could improve
+performance as long as it doesn't compete with connections. A task to refresh
+resolution at TTLs could be first step.
 
 ### Backpressure
 
-We limit number of connections and queue size via flags strictly as a way to control total memory usage. This could be made more fair by enforcing per port quotas, but that seems fraught with assumptions about which traffic is critical for the client. We could also strictly bound the queue wait time to avoid long delays by waiting in the queue, but for now this can be tuned via the relative sizes of max connections.
+We limit number of connections and queue size via flags strictly as a way to
+control total memory usage. This could be made more fair by enforcing per port
+quotas, but that seems fraught with assumptions about which traffic is critical
+for the client. We could also strictly bound the queue wait time to avoid long
+delays by waiting in the queue, but for now this can be tuned via the relative
+sizes of max connections.
 
-As is this means that we actively pull new connections off the network queue and drop them. This was deliberately chosen over letting them sit. A prompt closure allows the client to make better decisions than a vague increase in latency, where they can't be sure of the cause. The limited queue in the proxy makes the proportion of traffic that gets this treatment tunable and for the rest their attempts are promptly dropped.
+As is this means that we actively pull new connections off the network queue
+and drop them. This was deliberately chosen over letting them sit. A prompt
+closure allows the client to make better decisions than a vague increase in
+latency, where they can't be sure of the cause. The limited queue in the proxy
+makes the proportion of traffic that gets this treatment tunable and for the
+rest their attempts are promptly dropped.
 
 ### Datastructure for backend status
 
-We need some way to keep track of backend state. This will be checked for every connection and shared across tasks, so we should consider what the right tradeoffs should be based on expected and potentially worst case performance. In the normal operating case, I expect for the need to update these backend statuses to be rare. In most cases they'll be up, and if not we should mark them and potentially monitor them for cool down. In a pathological case where all backends or most are failing, the latency induced by trying these backends probably outweighs some of the more nuanced performance downsides of our chosen concurrency solution.
+We need some way to keep track of backend state. This will be checked for every
+connection and shared across tasks, so we should consider what the right
+tradeoffs should be based on expected and potentially worst case performance.
+In the normal operating case, I expect for the need to update these backend
+statuses to be rare. In most cases they'll be up, and if not we should mark
+them and potentially monitor them for cool down. In a pathological case where
+all backends or most are failing, the latency induced by trying these backends
+probably outweighs some of the more nuanced performance downsides of our chosen
+concurrency solution.
 
-The data model was designed to support this "minimal mutation required" approach. We have a 2 value enum to represent 3 states. A backend is either serving traffic, cooling down, or drained. To represent cooldown we use a simple `Instant`, where if that is in the future, the backend is still cooling down. Once this cooldown expires it doesn't need to be updated. There are cases where we'll try to connect to cooling backends and if successful, we do remove the cooldown, but typically this shouldn't be necessary. This should make an assumption that we are almost always reading and very rarely writing a valid one. If we need more granular partial cooldowns we may need to add to this model.
+The data model was designed to support this "minimal mutation required"
+approach. We have a 2 value enum to represent 3 states. A backend is either
+serving traffic, cooling down, or drained. To represent cooldown we use a
+simple `Instant`, where if that is in the future, the backend is still cooling
+down. Once this cooldown expires it doesn't need to be updated. There are cases
+where we'll try to connect to cooling backends and if successful, we do remove
+the cooldown, but typically this shouldn't be necessary. This should make an
+assumption that we are almost always reading and very rarely writing a valid
+one. If we need more granular partial cooldowns we may need to add to this
+model.
 
-A mutex per backend would be safe, but would increase contention for reads, and rwlocks typically don't fare much better. Even though critical sections are short, both serve to put a kind of ceiling on concurrency which can be roughly translated to throughput of the proxy.
+A mutex per backend would be safe, but would increase contention for reads, and
+rwlocks typically don't fare much better. Even though critical sections are
+short, both serve to put a kind of ceiling on concurrency which can be roughly
+translated to throughput of the proxy.
 
-Lock-free with atomics is an option, but would require losing some information by being a bit creative with integer types.
+Lock-free with atomics is an option, but would require losing some information
+by being a bit creative with integer types.
 
-ArcSwap allows us to optimize for the read path without dealing with the cache bounce penalty for rwlocks or mutexes. The obvious downside is that if many backends start failing, performance suffers a bit as writes to the target state map will be more common and each new one requires a new heap allocation. In a situation like that though, it's probable that the penalty for writing / swapping heap refs is overshadowed by the latency of failing backends.
+ArcSwap allows us to optimize for the read path without dealing with the cache
+bounce penalty for rwlocks or mutexes. The obvious downside is that if many
+backends start failing, performance suffers a bit as writes to the target state
+map will be more common and each new one requires a new heap allocation. In a
+situation like that though, it's probable that the penalty for writing /
+swapping heap refs is overshadowed by the latency of failing backends.
 
 ### Cooldown handling is intentionally loose
 
-We don't require that we get 100% consistency. The cooldown state of a backend can be stepped on by another attempt that had success, e.g. This is generally fine. Handling that would require much more concurrency control, more blocking and contention, etc. If one task could connect and the other couldn't, they're probably both right at some level.
+We don't require that we get 100% consistency. The cooldown state of a backend
+can be stepped on by another attempt that had success, e.g. This is generally
+fine. Handling that would require much more concurrency control, more blocking
+and contention, etc. If one task could connect and the other couldn't, they're
+probably both right at some level.
 
 Things we should do that we don't yet:
 
-- Vary the cooldown by the failure type. NxDomain is much different from connection refused, e.g.
-- Track connection latency. If latency climbs for a target, start a full or partial cooldown.
-- Implement partial cooldown. The all or nothing switch we currently have is coarse and will have the effect of slamming healthy backends until they refuse to connect. All gas or all brake (See backend drain below).
+- Vary the cooldown by the failure type. NxDomain is much different from
+  connection refused, e.g.
+- Track connection latency. If latency climbs for a target, start a full or
+  partial cooldown.
+- Implement partial cooldown. The all or nothing switch we currently have is
+  coarse and will have the effect of slamming healthy backends until they
+  refuse to connect. All gas or all brake (See backend drain below).
 
 ### Generics over dynamic dispatch
 
-I wanted to avoid `async-trait` mostly to learn using the newer native support for async functions in traits. This proxy doesn't have a need yet for anything other than statically defined types and trait implementations. There are some performance benefits as well, but I suspect they aren't significant.
+I wanted to avoid `async-trait` mostly to learn using the newer native support
+for async functions in traits. This proxy doesn't have a need yet for anything
+other than statically defined types and trait implementations. There are some
+performance benefits as well, but I suspect they aren't significant.
 
 ### Shutdown Drain
 
-On shutdown either via SIGINT or some error in accept, we attempt to drain the existing connections for 10s, after which we drop the remaining open connections. This could be cleaner, but is a reasonable simple first-pass.
+On shutdown either via SIGINT or some error in accept, we attempt to drain the
+existing connections for 10s, after which we drop the remaining open
+connections. This could be cleaner, but is a reasonable simple first-pass.
 
 ### Backend Drain
 
-The backend state `Drain` is unused currently. Most of the failures we handle can be transient, even NXDOMAIN, so a full drain is too heavy handed. Drain is reserved for use in user drains/undrains, which is unimplemented. We could be smarter about how we cool down, varying cooldowns based on the error, and tracking continuous failures.
+The backend state `Drain` is unused currently. Most of the failures we handle
+can be transient, even NXDOMAIN, so a full drain is too heavy handed. Drain is
+reserved for use in user drains/undrains, which is unimplemented. We could be
+smarter about how we cool down, varying cooldowns based on the error, and
+tracking continuous failures.
+
+Of note, right now if we enabled `Drain` it would be best effort, there is a
+small chance a `Drain` would be stepped on by a status update in the cooldown
+handler. To implement commanded `Drain` we'd need a compare and swap or a lock
+to write the status update there.
 
 ### Accept Error Handling
 
-There is some but not total agreement about how to handle errors in libraries and binaries like this in the broader community. Most proxy libraries in the Rust ecosystem seem to take an "always up" approach by default, which makes sense from a library perspective. Very few do any sort of exponential backoff, and most do not bound their retries for a failed accept. Many of these either don't expose the OS-level error to the library client or use `ErrorKind`, which doesn't currently handle all of the OS-level classifications that can matter to these proxies. There are a few `ErrorKind`s that most consider immediately retriable: `ConnectionRefused`, `ConnectionAborted`, `ConnectionReset`.
+There is some but not total agreement about how to handle errors in libraries
+and binaries like this in the broader community. Most proxy libraries in the
+Rust ecosystem seem to take an "always up" approach by default, which makes
+sense from a library perspective. Very few do any sort of exponential backoff,
+and most do not bound their retries for a failed accept. Many of these either
+don't expose the OS-level error to the library client or use `ErrorKind`, which
+doesn't currently handle all of the OS-level classifications that can matter to
+these proxies. There are a few `ErrorKind`s that most consider immediately
+retriable: `ConnectionRefused`, `ConnectionAborted`, `ConnectionReset`.
 
-There is a choice broadly between "stay up and limp" and "crash and log" in some sense. Most libraries make the assumption that the client would want to keep running in a wounded state and make a bit of noise about what is failing, but this seems like a trade off between limping and bouncing / potentially crash looping. This binary makes the choice to prefer crashing when we lose a port to a fatal error. The rationale is that we're configured to run on a set of ports, and if we can't do that, we should crash and dump. The most common condition these libraries discuss is fd exhaustion (either per process or for the system) and because we attempt to control volume with the queue, a crash is more appropriate as it suggests misconfiguration. This behavior is similar to the hyper [`set_sleep_on_errors(false)`](https://github.com/hyperium/hyper/blob/v0.14.30/src/server/tcp.rs#L201) option.
+There is a choice broadly between "stay up and limp" and "crash and log" in
+some sense. Most libraries make the assumption that the client would want to
+keep running in a wounded state and make a bit of noise about what is failing,
+but this seems like a trade off between limping and bouncing / potentially
+crash looping. This binary makes the choice to prefer crashing when we lose a
+port to a fatal error. The rationale is that we're configured to run on a set
+of ports, and if we can't do that, we should crash and dump. The most common
+condition these libraries discuss is fd exhaustion (either per process or for
+the system) and because we attempt to control volume with the queue, a crash is
+more appropriate as it suggests misconfiguration. This behavior is similar to
+the hyper
+[`set_sleep_on_errors(false)`](https://github.com/hyperium/hyper/blob/v0.14.30/src/server/tcp.rs#L201)
+option.
 
-We use a short fixed backoff if we drop a connection for too many connections (a full pool + full queue). For the three `Connect`s above we retry immediately. For any other error we teardown the whole proxy.
+We do not backoff if we drop a connection for too many connections (a full pool
+and a full queue) in order to provide immediate feedback to clients and allow
+them to handle overload instead of sitting on queued connections. For the three
+`Connect`s above we retry immediately. For any other error we teardown the
+whole proxy.
 
 ### Bind Error Handling
 
-We fail eagerly for all bind errors. Ports are bound serially before listeners are registered to avoid needing to drain ports on a bind failure. Almost all of the existing proxies retry bind for address in use errors, which we likely should as well.
+We fail eagerly for all bind errors. Ports are bound serially before listeners
+are registered to avoid needing to drain ports on a bind failure. Almost all of
+the existing proxies retry bind for address in use errors, which we likely
+should as well.
 
 ### Proxy Test Harness
 
-We use a channel-based accept and connect (in a single threaded runtime) where the test harness initiates connections and determines the timing between them. Accept awaits a command from the test, a stream or an error along with a one-shot channel to synchronize the test with the accept. Accept returns the commanded stream or error to the proxy, after which all processing to handle the accept and potentially spawn the connection task is synchronous. Running in a single-threaded runtime means we can ensure that before accept runs, the harness can push exactly the backend stream half (or connection error) the test needs and have the fake balancer synchronously receive it to pair it with the client half. Backend commands work similarly, by convention sent before the accept commands so they queue before accept completes (behind the ack), before any connection task is spawned. We use an unbounded channel in both cases which gives us synchronous sends.
+We use a channel-based accept and connect (in a single threaded runtime) where
+the test harness initiates connections and determines the timing between them.
+Accept awaits a command from the test, a stream or an error along with a
+one-shot channel to synchronize the test with the accept. Accept returns the
+commanded stream or error to the proxy, after which all processing to handle
+the accept and potentially spawn the connection task is synchronous. Running in
+a single-threaded runtime means we can ensure that before accept runs, the
+harness can push exactly the backend stream half (or connection error) the test
+needs and have the fake balancer synchronously receive it to pair it with the
+client half. Backend commands work similarly, by convention sent before the
+accept commands so they queue before accept completes (behind the ack), before
+any connection task is spawned. We use an unbounded channel in both cases which
+gives us synchronous sends.
 
-This setup gives the test deterministic control of connection pairing and ordering as well as the ability to sequence connections to setup specific behavior. Single-threaded execution is a drawback, but is still useful to test much of the proxy logic deterministically. We'd need more concurrency control to get this capability multi-threaded. We should rely on integration-style tests to exercise both the multi-threaded behavior and the production implementations of the network and balancer traits.
+This setup gives the test deterministic control of connection pairing and
+ordering as well as the ability to sequence connections to setup specific
+behavior. Single-threaded execution is a drawback, but is still useful to test
+much of the proxy logic deterministically. We'd need more concurrency control
+to get this capability multi-threaded. We should rely on integration-style
+tests to exercise both the multi-threaded behavior and the production
+implementations of the network and balancer traits.
 
-This setup, though less so than the one below, still risks misalignment between the client and backend pair if we're not careful. Harness methods attempt to avoid this by construction, e.g. the backend_connect_fail method doesn't return a backend, only a client. I added `no_backend` to the harness, which creates a client connection but no backend connection expecting the attempt to be aborted between accept and connection to a backend (too many connections was the motivating case). I've added timeouts so that hopefully we can see this mistake as a panic rather than a hang (in start_paused), but it might be prudent to improve the safety here eventually.
+This setup, though less so than the one below, still risks misalignment between
+the client and backend pair if we're not careful. Harness methods attempt to
+avoid this by construction, e.g. the backend_connect_fail method doesn't return
+a backend, only a client. I added `no_backend` to the harness, which creates a
+client connection but no backend connection expecting the attempt to be aborted
+between accept and connection to a backend (too many connections was the
+motivating case). I've added timeouts so that hopefully we can see this mistake
+as a panic rather than a hang (in start_paused), but it might be prudent to
+improve the safety here eventually.
 
-I landed on this after a few iterations that fell a bit short. First attempt was to define a script in a builder for the fake listener and balancer (client and backend connection order and behavior) as in [e605b2f](https://github.com/andwilley/rust-tcpproxy/commit/e605b2f14d87db0d0ed400c8331638c088a88eae). This allowed the test to define a series of behaviors during setup and make assertions about them once the proxy started. Even with a test harness ([fa460ea](https://github.com/andwilley/rust-tcpproxy/commit/fa460ea3ec2ed18f0736289939590ae1a932c33a)) to manage starting and tearing down the proxy this was awkward and error prone. I attempted to keep alignment by inserting stubs for failed connections in the returned test stream halves, but this proved to be unreliable and still awkward with a lot of pattern matching. It also forced the test author to essentially write the sequence they were trying to test in three different places, the accept script, the backend script, and the assertions. It had the additional downside that the entire script, every accept and connection, was run eagerly when the first read was awaited in the test. This made tests that relied on timing of several events difficult or impossible to express or make any assertions about.
+I landed on this after a few iterations that fell a bit short. First attempt
+was to define a script in a builder for the fake listener and balancer (client
+and backend connection order and behavior) as in
+[e605b2f](https://github.com/andwilley/rust-tcpproxy/commit/e605b2f14d87db0d0ed400c8331638c088a88eae).
+This allowed the test to define a series of behaviors during setup and make
+assertions about them once the proxy started. Even with a test harness
+([fa460ea](https://github.com/andwilley/rust-tcpproxy/commit/fa460ea3ec2ed18f0736289939590ae1a932c33a))
+to manage starting and tearing down the proxy this was awkward and error prone.
+I attempted to keep alignment by inserting stubs for failed connections in the
+returned test stream halves, but this proved to be unreliable and still awkward
+with a lot of pattern matching. It also forced the test author to essentially
+write the sequence they were trying to test in three different places, the
+accept script, the backend script, and the assertions. It had the additional
+downside that the entire script, every accept and connection, was run eagerly
+when the first read was awaited in the test. This made tests that relied on
+timing of several events difficult or impossible to express or make any
+assertions about.
 
 ### Round Robin Test Harness
 
-Landed on a simple per-connection script. For unit testing the RR balancer I just needed this basic functionality. If something more complicated is needed, we can adjust when we need it, but this will allow us to have some unit test coverage and a proper integration test will excercise the real implementations of dependencies.
+Landed on a simple per-connection script. For unit testing the RR balancer I
+just needed this basic functionality. If something more complicated is needed,
+we can adjust when we need it, but this will allow us to have some unit test
+coverage and a proper integration test will exercise the real implementations
+of dependencies.
 
-TODO
-----
+### Static JSON config
 
-- [ ] In Progress: Testing
-  - [x] Mock traits for testing
-  - [x] Proxy logic unit tests
-  - [x] Round robin fakes and harness
-  - [ ] Round robin unit tests [In progress]
-  - [ ] Simple cooldown unit tests
-  - [ ] Manual end-to-end test with fake backends
-  - [ ] Automated integration tests
-  - [ ] Load tests, performance benchmarks
-- [ ] Next: Metrics/telemetry
-- [ ] Validate configuration on load
-- [ ] Documentation comments throughout
-- [ ] Check file descriptor limits, possibly fail fast for misconfig with pool + queue size
-- [ ] Remove ArcSwap types from public APIs (TargetState)
-- [ ] Improve the configuration structure
-- [ ] Configurable queue wait time
-- [x] Configurable copy buffer sizes
-  - [x] 8 KB default buffer size for `copy_bidirectional` not configurable
-  - [x] This would have to handle backpressure as well (sender faster than receiver e.g.)
-- [ ] Pathological cases
-  - [ ] All backends fail to connect at the same time
-  - [ ] DNS outage
-  - [ ] Malicious clients (slow loris, retry storm, etc)
-- [ ] Configurable overall connection timeout
+This is simple and quick to get started with. The config shape is adapted from
+the Fly.io challenge (this project is not a submission for this challenge).
+Dynamic discovery of this mapping would be ideal.
 
-Future features
----------------
+Remaining work
+--------------
 
+### Testing
+
+- More unit tests for proxy and round robin, add tests for the cooldown handler.
+- Integration testing for a prod trait proxy
+- Eventually performance benchmarks
+
+### Metrics and logging
+
+- Some of the logging is noise, which should be cleaned up
+- Metrics/telemetry to track progress and performance
+
+### Documentation
+
+- Documentation is missing or inadequate throughout
+
+### Config validation
+
+- However the config ends up looking, right now there is no validation that it
+  is correct, config errors will surface during execution instead of at
+  startup.
+
+### Features
+
+- I should ensure that file descriptor limits and the configuration for pool
+  and queue size are compatible
+- It likely makes sense for the configuration to specify how long to wait for
+  the queue and how deep the queue should be.
 - Dynamic backend discovery
   - On demand backend drain/undrain
   - Change backend mapping
   - Would have to support draining now unmapped backends and undraining new ones
 - Denylist for IPs or ranges
 - Background DNS resolution
+
+### General cleanup
+
+- I currently leak ArcSwap types in my config and state API, this should be
+  replaced with standard types and hide the implementation detail.
+
+### Pathological cases
+
+- All backends fail to connect at the same time
+- DNS outage
+- Malicious clients (slow loris, retry storm, etc)

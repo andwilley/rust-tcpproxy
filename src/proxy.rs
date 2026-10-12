@@ -63,6 +63,7 @@ where
                 .await
                 .map_err(|e| e.maybe_into_bind_error(&addr))?;
             port_listeners.push((port, listener));
+            info!("listening on port {port}");
         }
         for (port, listener) in port_listeners {
             handles.spawn(listen(
@@ -127,6 +128,7 @@ where
                     if let Err(e) = res {
                         error!(port, err = %e, "connection task panicked");
                     }
+                    info!("closed connection")
                 }
                 let accept_result = listener.accept().await;
                 match accept_connection(
@@ -194,7 +196,7 @@ where
     B: LoadBalancer,
     S: AsyncStream,
 {
-    let (in_sock, _source_addr) = match accept_result {
+    let (in_sock, source_addr) = match accept_result {
         Ok(res) => res,
         Err(e) => {
             if let ProxyError::IoError(io_err) = &e {
@@ -213,6 +215,7 @@ where
     };
     let new_balancer = balancer.clone();
     if let Ok(permit) = open_connections.clone().try_acquire_owned() {
+        info!("accepted connection on {source_addr}");
         connections.spawn(async move {
             let _permit = permit;
             if let Err(e) = do_connection(port, in_sock, new_balancer, copy_buf_size).await {
@@ -224,6 +227,7 @@ where
 
     if let Ok(queue_slot) = queued_connections.clone().try_acquire_owned() {
         let new_open_connections = open_connections.clone();
+        info!("queueing connection on {source_addr}");
         connections.spawn(async move {
             let Ok(_permit) = new_open_connections.clone().acquire_owned().await else {
                 return;

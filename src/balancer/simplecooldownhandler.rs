@@ -23,13 +23,17 @@ impl CooldownHandler for SimpleCooldownHandler {
         Ok(status)
     }
 
-    /// Always update cooldown on failure. Remove a cooldown if we connected successfully during
-    /// one.
+    /// Update cooldown on failure unless the target is drained. Remove a cooldown if we connected
+    /// successfully during one.
     fn report_connection_attempt(
         &self,
         target: &str,
         result: ConnectResult,
     ) -> Result<(), ProxyError> {
+        let Alive { cool_until } = self.get_target_status(target)? else {
+            // Drained
+            return Ok(());
+        };
         let now = Instant::now();
         if result == Failure {
             self.targets.update_target_status(
@@ -40,10 +44,8 @@ impl CooldownHandler for SimpleCooldownHandler {
             )?;
             return Ok(());
         }
-        let Alive {
-            cool_until: Some(until),
-        } = self.get_target_status(target)?
-        else {
+        let Some(until) = cool_until else {
+            // Already alive
             return Ok(());
         };
         if until > now {
