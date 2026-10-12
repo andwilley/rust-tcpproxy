@@ -13,9 +13,22 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-/// TODO docs for harness
-/// This currently only supports testing the RR balancer in isolation, so testing actual connections
-/// isn't exposed yet.
+/// A test harness for unit testing the RoundRobinBalancer. Currently supports a single cripted
+/// behvaior (cooldown and connect) per harness instance. Describe your scripted behavior for each
+/// backend and construct the harness, then invoke connect_backend and assert on the data returned
+/// or the events log, which records work done by the fakes in the test.
+/// TODO:
+/// - Support updating the script between invocations of connect_backend. This most likely looks
+///   like a shared reference to the script maps owned by the harness and a method on the harness to
+///   update or add a key.
+/// - Support expecting logs and throwing when we see unexpected warnings or higher.
+/// - Consider just IDing targets by their order in the config. On the fence as this may make that
+///   behavior more surprising than forcing naming by the test writer, but it would simplify the
+///   harness API.
+/// - Hand out the test-side of the connection when we attempt connection. These tests don't require
+///   it, but future tests would likely benefit. This almost certainly looks like creating the
+///   connection on the invocation of the harness's connect_backend, passing the proxy side to the
+///   connector and returning the test side to the caller with the connection result.
 #[derive(Debug)]
 pub struct RoundRobinHarness {
     events: Arc<Mutex<Vec<fakes::TestEvent>>>,
@@ -84,8 +97,7 @@ impl RoundRobinHarness {
         RoundRobinHarness { balancer, events }
     }
 
-    // TODO:
-    // define methods on the harness to interact with the balancer and assert on events.
+    /// Run the round robin balancer for the present script.
     pub async fn connect_backend(&self, for_port: u16) -> Result<ConnectedBackendData, ProxyError> {
         let res = self.balancer.connect_backend(for_port).await;
         match res {
@@ -94,7 +106,7 @@ impl RoundRobinHarness {
         }
     }
 
-    pub fn cooldown_events(&self) -> Vec<fakes::TestEvent> {
+    pub fn get_status_events(&self) -> Vec<fakes::TestEvent> {
         self.events_where(|e| matches!(e, fakes::TestEvent::GotCooldownStatus { .. }))
     }
 
@@ -116,6 +128,7 @@ impl RoundRobinHarness {
     }
 }
 
+/// Test-relevant data about a particular connected backend.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ConnectedBackendData {
     pub target_id: usize,
@@ -152,13 +165,9 @@ impl From<SocketAddr> for ConnectedBackendData {
 ///                 ^  ^        ^ ^ ^
 ///                 |  |        | | |
 ///                 |  |        | | used to drive test behavior
-///                 |  |        | |
 ///                 |  |        | unused
-///                 |  |        |
 ///                 |  |        unused
-///                 |  |
 ///                 |  an extra differentiator for uniqueness
-///                 |
 ///                 the ID provided via port number for this target
 fn test_sock(id: u8, instance: u8, port: u16) -> SocketAddr {
     SocketAddr::from((Ipv4Addr::new(id, instance, 0, 0), port))
@@ -187,6 +196,7 @@ pub mod fakes {
     pub const SOCK_GOOD: u16 = 1111;
     pub const SOCK_CONNECT_ERR: u16 = 7777;
 
+    /// A script for how a particular backend should behave during a single test.
     #[derive(Debug)]
     pub struct BackendScript {
         pub cooldown: CooldownSpec,
@@ -206,7 +216,8 @@ pub mod fakes {
     pub enum ConnectSpec {
         ResolveError(ResolveErrorSpec),
         Success {
-            // This many resolved addrs will fail, then one will succeed.
+            // This many resolved addrs will fail, then one, at instance `bad_socket_cnt` will
+            // succeed.
             bad_socket_cnt: u8,
         },
         SockFail {
@@ -375,8 +386,8 @@ pub mod fakes {
         }
     }
 
-    /// Fake connector which connects backends based on a script and records attempts in test
-    /// events.
+    /// Fake connector which connects backends based on specifically assigned port numbers and
+    /// records attempts in test events. This throws away the test-side of the connection.
     #[derive(Clone, Debug)]
     pub struct FakeConnector {
         events: Arc<Mutex<Vec<TestEvent>>>,

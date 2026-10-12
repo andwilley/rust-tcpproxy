@@ -81,26 +81,32 @@ This setup, though less so than the one below, still risks misalignment between 
 
 I landed on this after a few iterations that fell a bit short. First attempt was to define a script in a builder for the fake listener and balancer (client and backend connection order and behavior) as in [e605b2f](https://github.com/andwilley/rust-tcpproxy/commit/e605b2f14d87db0d0ed400c8331638c088a88eae). This allowed the test to define a series of behaviors during setup and make assertions about them once the proxy started. Even with a test harness ([fa460ea](https://github.com/andwilley/rust-tcpproxy/commit/fa460ea3ec2ed18f0736289939590ae1a932c33a)) to manage starting and tearing down the proxy this was awkward and error prone. I attempted to keep alignment by inserting stubs for failed connections in the returned test stream halves, but this proved to be unreliable and still awkward with a lot of pattern matching. It also forced the test author to essentially write the sequence they were trying to test in three different places, the accept script, the backend script, and the assertions. It had the additional downside that the entire script, every accept and connection, was run eagerly when the first read was awaited in the test. This made tests that relied on timing of several events difficult or impossible to express or make any assertions about.
 
+### Round Robin Test Harness
+
+Landed on a simple per-connection script. For unit testing the RR balancer I just needed this basic functionality. If something more complicated is needed, we can adjust when we need it, but this will allow us to have some unit test coverage and a proper integration test will excercise the real implementations of dependencies.
+
 TODO
 ----
 
 - [ ] In Progress: Testing
   - [x] Mock traits for testing
   - [x] Proxy logic unit tests
-  - [ ] Round robin fakes and unit tests [In progress]
+  - [x] Round robin fakes and harness
+  - [ ] Round robin unit tests [In progress]
   - [ ] Simple cooldown unit tests
   - [ ] Manual end-to-end test with fake backends
+  - [ ] Automated integration tests
   - [ ] Load tests, performance benchmarks
 - [ ] Next: Metrics/telemetry
-- [ ] Validate config targets on load
+- [ ] Validate configuration on load
 - [ ] Documentation comments throughout
 - [ ] Check file descriptor limits, possibly fail fast for misconfig with pool + queue size
 - [ ] Remove ArcSwap types from public APIs (TargetState)
 - [ ] Improve the configuration structure
 - [ ] Configurable queue wait time
-- [ ] Configurable copy buffer sizes
-  - [ ] 8 KB default buffer size for `copy_bidirectional` not configurable
-  - [ ] This would have to handle backpressure as well (sender faster than receiver e.g.)
+- [x] Configurable copy buffer sizes
+  - [x] 8 KB default buffer size for `copy_bidirectional` not configurable
+  - [x] This would have to handle backpressure as well (sender faster than receiver e.g.)
 - [ ] Pathological cases
   - [ ] All backends fail to connect at the same time
   - [ ] DNS outage

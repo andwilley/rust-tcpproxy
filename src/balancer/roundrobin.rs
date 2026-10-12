@@ -63,7 +63,7 @@ where
         if backends.is_empty() {
             return Err(ProxyError::TargetResolutionError {
                 port: for_port,
-                message: format!("empty backends list for port {for_port}"),
+                message: format!("Empty backends list for port {for_port}"),
             });
         }
 
@@ -71,7 +71,7 @@ where
             Some(counter) => counter.fetch_add(1, Relaxed) % backends.len(),
             None => {
                 return Err(ProxyError::ProxyStateError {
-                    message: format!("failed to load round robin counter for port {for_port}"),
+                    message: format!("Failed to load round robin counter for port {for_port}"),
                 });
             }
         };
@@ -184,6 +184,7 @@ where
     }
 }
 
+/// TODO: The unused token warnings are essentially the remaining test coverage TODOs.
 #[cfg(test)]
 mod tests {
     use crate::{
@@ -195,6 +196,7 @@ mod tests {
             },
         },
         config::{App, RawConfig},
+        errors::ProxyError,
         state::ProxyConfig,
     };
     use std::{
@@ -273,26 +275,28 @@ mod tests {
             },
         );
         behaviors.insert(BACKEND_2.to_string(), BackendScript::default());
+        // Should not get this far.
+        behaviors.insert(BACKEND_3.to_string(), BackendScript::default());
         let harness = RoundRobinHarness::new(
             default_config(vec![
                 BACKEND_0.to_string(),
                 BACKEND_1.to_string(),
                 BACKEND_2.to_string(),
+                BACKEND_3.to_string(),
             ]),
             behaviors,
         );
 
-        // skips all cooling backends and connects to first alive
+        // skips all cooling backends and connects to first alive (backend 2)
         let connection = harness
             .connect_backend(PORT)
             .await
             .expect("Should connect OK");
 
-        // behavior 1 is the connect, after the skip for cooling
         let expected = ConnectedBackendData::new(2, 0);
         assert_eq!(connection, expected);
         // Attempt results in skipping first 2 backends
-        let expected_cooldowns = vec![
+        let expected_status_checks = vec![
             GotCooldownStatus {
                 backend: BACKEND_0.to_string(),
             },
@@ -303,8 +307,9 @@ mod tests {
                 backend: BACKEND_2.to_string(),
             },
         ];
-        let actual_cooldowns = harness.cooldown_events();
-        assert_eq!(actual_cooldowns, expected_cooldowns);
+        let actual_cooldowns = harness.get_status_events();
+        assert_eq!(actual_cooldowns, expected_status_checks);
+        // And only attempts resolution for backend 2.
         let actual_resolves = harness.resolve_events();
         let expected_resolves = vec![ResolveAttempted {
             host: BACKEND_2.to_string(),
@@ -330,8 +335,19 @@ mod tests {
                 connect: ConnectSpec::Success { bad_socket_cnt: 0 },
             },
         );
+        behaviors.insert(
+            BACKEND_2.to_string(),
+            BackendScript {
+                cooldown: CooldownSpec::Cooling { until: later },
+                connect: ConnectSpec::Success { bad_socket_cnt: 0 },
+            },
+        );
         let harness = RoundRobinHarness::new(
-            default_config(vec![BACKEND_0.to_string(), BACKEND_1.to_string()]),
+            default_config(vec![
+                BACKEND_0.to_string(),
+                BACKEND_1.to_string(),
+                BACKEND_2.to_string(),
+            ]),
             behaviors,
         );
 
@@ -344,12 +360,13 @@ mod tests {
             .connect_backend(PORT)
             .await
             .expect("Should connect OK");
+        let connection_2 = harness
+            .connect_backend(PORT)
+            .await
+            .expect("Should connect OK");
 
-        // behavior 1 for each is the connect, after the skip for cooling
+        // First connection
         let expected_0 = ConnectedBackendData::new(0, 0);
-        let expected_1 = ConnectedBackendData::new(1, 0);
-        assert_eq!(connection_0, expected_0);
-        assert_eq!(connection_1, expected_1);
         // Each attempt results in skipping each backend then retying in RR order.
         let expected_first_connection_cooldowns = vec![
             GotCooldownStatus {
@@ -358,19 +375,131 @@ mod tests {
             GotCooldownStatus {
                 backend: BACKEND_1.to_string(),
             },
+            GotCooldownStatus {
+                backend: BACKEND_2.to_string(),
+            },
         ];
-        let actual_cooldowns = harness.cooldown_events();
-        assert_eq!(actual_cooldowns[..2], expected_first_connection_cooldowns);
+        assert_eq!(connection_0, expected_0);
+        let actual_cooldowns = harness.get_status_events();
+        assert_eq!(actual_cooldowns[..3], expected_first_connection_cooldowns);
+
+        // Second connection - check starts at index 1.
+        let expected_1 = ConnectedBackendData::new(1, 0);
+        assert_eq!(connection_1, expected_1);
         let expected_second_connection_cooldowns = vec![
             GotCooldownStatus {
                 backend: BACKEND_1.to_string(),
             },
             GotCooldownStatus {
+                backend: BACKEND_2.to_string(),
+            },
+            GotCooldownStatus {
                 backend: BACKEND_0.to_string(),
             },
         ];
-        // after first connection's resolve, connect, report events
-        assert_eq!(actual_cooldowns[2..], expected_second_connection_cooldowns);
+        assert_eq!(actual_cooldowns[3..6], expected_second_connection_cooldowns);
+
+        // Third connection
+        let expected_2 = ConnectedBackendData::new(2, 0);
+        assert_eq!(connection_2, expected_2);
+        let expected_second_connection_cooldowns = vec![
+            GotCooldownStatus {
+                backend: BACKEND_2.to_string(),
+            },
+            GotCooldownStatus {
+                backend: BACKEND_0.to_string(),
+            },
+            GotCooldownStatus {
+                backend: BACKEND_1.to_string(),
+            },
+        ];
+        assert_eq!(actual_cooldowns[6..], expected_second_connection_cooldowns);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_targets_fails() {
+        let harness = RoundRobinHarness::new(default_config(Vec::new()), HashMap::new());
+        const BAD_PORT: u16 = 9876;
+        match harness.connect_backend(BAD_PORT).await {
+            Err(ProxyError::TargetResolutionError { port, message }) => {
+                assert_eq!(port, BAD_PORT);
+                assert_eq!(message, "No targets configured");
+            }
+            other => panic!("expected target resolution error but got: {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_targets_fails() {
+        let harness = RoundRobinHarness::new(default_config(Vec::new()), HashMap::new());
+        match harness.connect_backend(PORT).await {
+            Err(ProxyError::TargetResolutionError { port, message }) => {
+                assert_eq!(port, PORT);
+                assert_eq!(message, format!("Empty backends list for port {PORT}"));
+            }
+            other => panic!("expected target resolution error but got: {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn all_backends_drained_fail() {
+        let mut behaviors = HashMap::new();
+        behaviors.insert(
+            BACKEND_0.to_string(),
+            BackendScript {
+                cooldown: CooldownSpec::Drain,
+                connect: ConnectSpec::NoConnection,
+            },
+        );
+        behaviors.insert(
+            BACKEND_1.to_string(),
+            BackendScript {
+                cooldown: CooldownSpec::Drain,
+                connect: ConnectSpec::NoConnection,
+            },
+        );
+        behaviors.insert(
+            BACKEND_2.to_string(),
+            BackendScript {
+                cooldown: CooldownSpec::Drain,
+                connect: ConnectSpec::NoConnection,
+            },
+        );
+        behaviors.insert(
+            BACKEND_3.to_string(),
+            BackendScript {
+                cooldown: CooldownSpec::Drain,
+                connect: ConnectSpec::NoConnection,
+            },
+        );
+        behaviors.insert(
+            BACKEND_4.to_string(),
+            BackendScript {
+                cooldown: CooldownSpec::Drain,
+                connect: ConnectSpec::NoConnection,
+            },
+        );
+        let harness = RoundRobinHarness::new(
+            default_config(vec![
+                BACKEND_0.to_string(),
+                BACKEND_1.to_string(),
+                BACKEND_2.to_string(),
+                BACKEND_3.to_string(),
+                BACKEND_4.to_string(),
+            ]),
+            behaviors,
+        );
+
+        match harness.connect_backend(PORT).await {
+            Err(ProxyError::ConnectionError { port, message }) => {
+                assert_eq!(port, PORT);
+                assert_eq!(
+                    message,
+                    format!("Unable to connect to any backend for port {PORT}")
+                );
+            }
+            other => panic!("expected target resolution error but got: {other:?}"),
+        }
     }
 
     const PORT: u16 = 8080;
@@ -390,11 +519,4 @@ mod tests {
         })
         .expect("config")
     }
-    /*
-    - no targets -> fail
-    - empty backends -> fail
-    - 5 backends, all backends drained -> fail
-    - 5 backends, 4 cooling, 5th connects
-    - 2 backends, 1 conn fail, 1 cooling, connects to the cooling backend
-    */
 }
