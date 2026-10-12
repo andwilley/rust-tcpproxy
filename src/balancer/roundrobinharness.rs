@@ -1,32 +1,21 @@
-use tokio::io::{DuplexStream, duplex};
-
 use crate::{
     balancer::{
         roundrobin::RoundRobinBalancer,
-        roundrobinharness::fakes::{BackendBehavior, FakeConnector, FakeCooldown, FakeResolver},
+        roundrobinharness::fakes::{ConnectSpec, FakeConnector, FakeCooldown, FakeResolver},
         traits::LoadBalancer,
     },
     errors::ProxyError,
-    state::{BackendStatus, ProxyConfig},
+    state::ProxyConfig,
 };
 use std::{
-    collections::{HashMap, VecDeque},
-    net::SocketAddr,
+    collections::{HashMap, HashSet},
+    net::{Ipv4Addr, SocketAddr},
     sync::{Arc, Mutex},
-    thread,
 };
 
 /// TODO docs for harness
 /// This currently only supports testing the RR balancer in isolation, so testing actual connections
 /// isn't exposed yet.
-/// - need to restructure this to make it easier to express the script without confusing alignment
-///   between behaviors.
-/// - consider making the last of any scripted behavior sticky so we don't have to fight alignment,
-///   some java rpc mock libraries do this. We can use a cursor instead of consuming scripts.
-/// - we should have an assertion that we used up the entire script
-/// - we should allow assertions on filtered versions of scripts to avoid depending on indexes.
-/// - we'll basically always want backends indexed in config order, just use index instead of port
-/// - add a bunch of validation to catch misconfiguration at test setup
 #[derive(Debug)]
 pub struct RoundRobinHarness {
     events: Arc<Mutex<Vec<fakes::TestEvent>>>,
@@ -34,123 +23,63 @@ pub struct RoundRobinHarness {
 }
 
 impl RoundRobinHarness {
-    pub fn new(config: ProxyConfig, script: HashMap<String, Vec<fakes::BackendBehavior>>) -> Self {
-        let mut cooldown_scripts = HashMap::new();
-        let mut resolve_scripts = HashMap::new();
-        let mut connect_scripts: HashMap<SocketAddr, VecDeque<Result<DuplexStream, ProxyError>>> =
-            HashMap::new();
-        for (target, behaviors) in script {
-            let mut cooldown_script: VecDeque<Result<BackendStatus, ProxyError>> = VecDeque::new();
-            let mut resolve_script: VecDeque<Result<Vec<SocketAddr>, ProxyError>> = VecDeque::new();
+    pub fn new(config: ProxyConfig, script: HashMap<String, fakes::BackendScript>) -> Self {
+        let mut cooldown_script = HashMap::new();
+        let mut resolve_script: HashMap<String, fakes::ResolveSpec> = HashMap::new();
+        let mut seen = HashSet::new();
+        for (target, behavior) in script {
             let (_, target_port) = target
                 .split_once(":")
                 .unwrap_or_else(|| panic!("parsable configured host:port but got {target}"));
-            let target_id: usize = target_port
+            let target_id: u8 = target_port
                 .parse()
-                .unwrap_or_else(|_| panic!("port parsable as usize but got {target_port}"));
-            assert!(
-                target_id <= 255,
-                "The backend port is used as an octet in the socket IP v4 address as an \
-                identifier, so must be less than or equal to 255"
-            );
-
-            for (b, behavior) in behaviors.into_iter().enumerate() {
-                match behavior {
-                    BackendBehavior::ConnectSuccess {
-                        cooldown,
-                        bad_socket_cnt,
-                    } => {
-                        cooldown_script.push_back(Ok(BackendStatus::Alive {
-                            cool_until: cooldown,
-                        }));
-
-                        let mut resolved = Vec::new();
-                        for i in 0..bad_socket_cnt {
-                            let bad_sock = test_sock(target_id, b, i, fakes::SOCK_FAIL);
-                            resolved.push(bad_sock);
-                        }
-                        let good_sock: SocketAddr = test_sock(target_id, b, 0, fakes::SOCK_GOOD);
-                        resolved.push(good_sock);
-                        resolve_script.push_back(Ok(resolved));
-                        let (_, proxy_end) = duplex(1024 * 8);
-                        connect_scripts
-                            .entry(good_sock)
-                            .or_default()
-                            .push_back(Ok(proxy_end));
-                    }
-                    BackendBehavior::ConnectSockFail { bad_socket_cnt } => {
-                        cooldown_script.push_back(Ok(BackendStatus::Alive { cool_until: None }));
-
-                        let mut resolved = Vec::new();
-                        for i in 0..bad_socket_cnt {
-                            let bad_sock = test_sock(target_id, b, i, fakes::SOCK_FAIL);
-                            resolved.push(bad_sock);
-                        }
-                        resolve_script.push_back(Ok(resolved));
-                    }
-                    BackendBehavior::ConnectFail {
-                        bad_socket_cnt,
-                        connect_error,
-                    } => {
-                        cooldown_script.push_back(Ok(BackendStatus::Alive { cool_until: None }));
-
-                        let mut resolved = Vec::new();
-                        for i in 0..bad_socket_cnt {
-                            let bad_sock = test_sock(target_id, b, i, fakes::SOCK_FAIL);
-                            resolved.push(bad_sock);
-                        }
-                        let good_sock: SocketAddr = test_sock(target_id, b, 0, fakes::SOCK_GOOD);
-                        resolved.push(good_sock);
-                        resolve_script.push_back(Ok(resolved));
-                        connect_scripts
-                            .entry(good_sock)
-                            .or_default()
-                            .push_back(Err(connect_error));
-                    }
-                    BackendBehavior::ConnectTimeout { bad_socket_cnt } => {
-                        cooldown_script.push_back(Ok(BackendStatus::Alive { cool_until: None }));
-
-                        let mut resolved = Vec::new();
-                        for i in 0..bad_socket_cnt {
-                            let bad_sock = test_sock(target_id, b, i, fakes::SOCK_FAIL);
-                            resolved.push(bad_sock);
-                        }
-                        let timeout_sock: SocketAddr =
-                            test_sock(target_id, b, 0, fakes::SOCK_TIMEOUT);
-                        resolved.push(timeout_sock);
-                        resolve_script.push_back(Ok(resolved));
-                        let (_, proxy_end) = duplex(1024 * 8);
-                        connect_scripts
-                            .entry(timeout_sock)
-                            .or_default()
-                            .push_back(Ok(proxy_end));
-                    }
-                    BackendBehavior::ResolveFail { resolve_error } => {
-                        cooldown_script.push_back(Ok(BackendStatus::Alive { cool_until: None }));
-                        resolve_script.push_back(Err(resolve_error));
-                    }
-                    BackendBehavior::CooldownCheckFail { cooldown_error } => {
-                        cooldown_script.push_back(Err(cooldown_error));
-                    }
-                    BackendBehavior::CooldownSkip { cooldown } => {
-                        cooldown_script.push_back(Ok(BackendStatus::Alive {
-                            cool_until: Some(cooldown),
-                        }));
-                    }
-                }
+                .unwrap_or_else(|_| panic!("port parsable as u8 but got {target_port}"));
+            if seen.contains(&target_id) {
+                panic!("target ID {target_id} already used");
             }
+            seen.insert(target_id);
 
-            cooldown_scripts.insert(target.clone(), Mutex::new(cooldown_script));
-            resolve_scripts.insert(target, Mutex::new(resolve_script));
+            cooldown_script.insert(target.clone(), behavior.cooldown);
+            match behavior.connect {
+                ConnectSpec::Success { bad_socket_cnt } => {
+                    let mut resolved = Vec::new();
+                    for i in 0..bad_socket_cnt {
+                        let bad_sock = test_sock(target_id, i, fakes::SOCK_FAIL);
+                        resolved.push(bad_sock);
+                    }
+                    let good_sock: SocketAddr =
+                        test_sock(target_id, bad_socket_cnt, fakes::SOCK_GOOD);
+                    resolved.push(good_sock);
+                    resolve_script.insert(target, fakes::ResolveSpec::Success(resolved));
+                }
+                ConnectSpec::SockFail { bad_socket_cnt } => {
+                    assert!(bad_socket_cnt > 0, "bad socket cnt must be greater than 0");
+                    let mut resolved = Vec::new();
+                    for i in 0..bad_socket_cnt {
+                        let bad_sock = test_sock(target_id, i, fakes::SOCK_FAIL);
+                        resolved.push(bad_sock);
+                    }
+                    resolve_script.insert(target, fakes::ResolveSpec::Success(resolved));
+                }
+                ConnectSpec::Fail => {
+                    let conn_err_sock: SocketAddr =
+                        test_sock(target_id, 0, fakes::SOCK_CONNECT_ERR);
+                    resolve_script.insert(target, fakes::ResolveSpec::Success(vec![conn_err_sock]));
+                }
+                ConnectSpec::Timeout => {
+                    let timeout_sock: SocketAddr = test_sock(target_id, 0, fakes::SOCK_TIMEOUT);
+                    resolve_script.insert(target, fakes::ResolveSpec::Success(vec![timeout_sock]));
+                }
+                ConnectSpec::ResolveError(resolve_error) => {
+                    resolve_script.insert(target, fakes::ResolveSpec::Error(resolve_error));
+                }
+                ConnectSpec::NoConnection => {}
+            }
         }
-        let locked_connect_scripts = connect_scripts
-            .into_iter()
-            .map(|(sock, behaviors)| (sock, Mutex::new(behaviors)))
-            .collect();
         let events = Arc::new(Mutex::new(Vec::new()));
-        let cooldown = FakeCooldown::new(cooldown_scripts, events.clone());
-        let resolver = FakeResolver::new(Arc::new(resolve_scripts), events.clone());
-        let connector = FakeConnector::new(Arc::new(locked_connect_scripts), events.clone());
+        let cooldown = FakeCooldown::new(cooldown_script, events.clone());
+        let resolver = FakeResolver::new(Arc::new(resolve_script), events.clone());
+        let connector = FakeConnector::new(events.clone());
         let balancer = RoundRobinBalancer::new(Arc::new(config), resolver, connector, cooldown);
         RoundRobinHarness { balancer, events }
     }
@@ -165,43 +94,39 @@ impl RoundRobinHarness {
         }
     }
 
-    pub fn events(&self) -> Vec<fakes::TestEvent> {
-        self.events.lock().expect("clean lock on events").clone()
+    pub fn cooldown_events(&self) -> Vec<fakes::TestEvent> {
+        self.events_where(|e| matches!(e, fakes::TestEvent::GotCooldownStatus { .. }))
     }
 
-    pub fn print_events(&self) {
-        eprintln!("--- SUT event log dump ---",);
-        let Ok(events) = self.events.try_lock() else {
-            eprintln!("    <locked>");
-            return;
-        };
-        for (i, e) in events.iter().enumerate() {
-            eprintln!("{i}: {e:?}");
-        }
+    pub fn resolve_events(&self) -> Vec<fakes::TestEvent> {
+        self.events_where(|e| matches!(e, fakes::TestEvent::ResolveAttempted { .. }))
     }
-}
 
-impl Drop for RoundRobinHarness {
-    fn drop(&mut self) {
-        if thread::panicking() {
-            self.print_events();
-        }
+    pub fn events_where(
+        &self,
+        mut filter: impl FnMut(&fakes::TestEvent) -> bool,
+    ) -> Vec<fakes::TestEvent> {
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|e| filter(e))
+            .cloned()
+            .collect()
     }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct ConnectedBackendData {
     pub target_id: usize,
-    pub behavior_num: usize,
     pub instance: usize,
 }
 
 impl ConnectedBackendData {
-    pub fn with_defaults(target_id: usize) -> Self {
+    pub fn new(target_id: usize, instance: usize) -> Self {
         ConnectedBackendData {
             target_id,
-            behavior_num: 0,
-            instance: 0,
+            instance,
         }
     }
 }
@@ -211,35 +136,32 @@ impl From<SocketAddr> for ConnectedBackendData {
         let SocketAddr::V4(addr) = source else {
             panic!("expected ipv4 address for test backend");
         };
-        let [id, b, instance, _] = addr.ip().octets();
+        let [id, _, instance, _] = addr.ip().octets();
         ConnectedBackendData {
             target_id: id.into(),
-            behavior_num: b.into(),
             instance: instance.into(),
         }
     }
 }
 
-/// Create an identifiable socket which encodes the backend `id` (the configured backend's port),
-/// its order in the behavior list for that target `b`, an `instance` number to differentiate
-/// several sockets for that enumeration, and the `port` which is mostly used to drive behavior.
+/// Create an identifiable socket which encodes the backend `id` (the configured backend's port), an
+/// `instance` number to differentiate several sockets for that enumeration, and the `port` which is
+/// mostly used to drive behavior.
 ///
-/// socket address: id.b.instance.x:port
-///                 ^  ^   ^      ^  ^
-///                 |  |   |      |  |
-///                 |  |   |      |  used to drive test behavior
-///                 |  |   |      |
-///                 |  |   |      unused
-///                 |  |   |
-///                 |  |   an extra differentiator for uniqueness
+/// socket address: id.instance.x.y:port
+///                 ^  ^        ^ ^ ^
+///                 |  |        | | |
+///                 |  |        | | used to drive test behavior
+///                 |  |        | |
+///                 |  |        | unused
+///                 |  |        |
+///                 |  |        unused
 ///                 |  |
-///                 |  the configured backend's port number for easy identification
+///                 |  an extra differentiator for uniqueness
 ///                 |
-///                 the index of this specified behavior for this target in the script
-fn test_sock(id: usize, b: usize, instance: usize, port: u16) -> SocketAddr {
-    format!("{}.{}.{}.0:{}", id, b, instance, port)
-        .parse()
-        .expect("parsed")
+///                 the ID provided via port number for this target
+fn test_sock(id: u8, instance: u8, port: u16) -> SocketAddr {
+    SocketAddr::from((Ipv4Addr::new(id, instance, 0, 0), port))
 }
 
 pub mod fakes {
@@ -250,7 +172,7 @@ pub mod fakes {
         state::BackendStatus,
     };
     use std::{
-        collections::{HashMap, VecDeque},
+        collections::HashMap,
         future::pending,
         io::{Error, ErrorKind},
         net::SocketAddr,
@@ -258,39 +180,42 @@ pub mod fakes {
         thread,
         time::Instant,
     };
-    use tokio::io::DuplexStream;
+    use tokio::io::{DuplexStream, duplex};
 
     pub const SOCK_FAIL: u16 = 9999;
     pub const SOCK_TIMEOUT: u16 = 8888;
     pub const SOCK_GOOD: u16 = 1111;
+    pub const SOCK_CONNECT_ERR: u16 = 7777;
 
-    pub enum BackendBehavior {
-        CooldownCheckFail {
-            cooldown_error: ProxyError,
+    #[derive(Debug)]
+    pub struct BackendScript {
+        pub cooldown: CooldownSpec,
+        pub connect: ConnectSpec,
+    }
+
+    impl Default for BackendScript {
+        fn default() -> Self {
+            BackendScript {
+                cooldown: CooldownSpec::Alive,
+                connect: ConnectSpec::Success { bad_socket_cnt: 0 },
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    pub enum ConnectSpec {
+        ResolveError(ResolveErrorSpec),
+        Success {
+            // This many resolved addrs will fail, then one will succeed.
+            bad_socket_cnt: u8,
         },
-        ResolveFail {
-            resolve_error: ProxyError,
+        SockFail {
+            // This many resolved addrs will fail, none will succeed.
+            bad_socket_cnt: u8,
         },
-        CooldownSkip {
-            cooldown: Instant,
-        },
-        ConnectSuccess {
-            cooldown: Option<Instant>,
-            // This many will fail, then one will succeed.
-            bad_socket_cnt: usize,
-        },
-        ConnectSockFail {
-            bad_socket_cnt: usize,
-        },
-        ConnectFail {
-            // This many will fail, then one will throw a different error.
-            bad_socket_cnt: usize,
-            connect_error: ProxyError,
-        },
-        ConnectTimeout {
-            // This many will fail, then one will timeout.
-            bad_socket_cnt: usize,
-        },
+        Fail,
+        Timeout,
+        NoConnection,
     }
 
     #[derive(Debug, PartialEq, Eq, Clone)]
@@ -311,17 +236,25 @@ pub mod fakes {
     }
 
     /// Fake CooldownHandler built with a script for each backend it handles and which records
-    /// invocations of this methods via test events. We don't support a drain script since the proxy
-    /// doesn't use it yet.
+    /// invocations of this methods via test events. Cooldown status is set per-test attempt. We
+    /// don't support a drain script since the proxy doesn't use it yet.
     #[derive(Debug)]
     pub struct FakeCooldown {
-        script: HashMap<String, Mutex<VecDeque<Result<BackendStatus, ProxyError>>>>,
+        script: HashMap<String, CooldownSpec>,
         events: Arc<Mutex<Vec<TestEvent>>>,
+    }
+
+    #[derive(Debug)]
+    pub enum CooldownSpec {
+        Alive,
+        Cooling { until: Instant },
+        Fail,
+        Drain,
     }
 
     impl FakeCooldown {
         pub fn new(
-            script: HashMap<String, Mutex<VecDeque<Result<BackendStatus, ProxyError>>>>,
+            script: HashMap<String, CooldownSpec>,
             events: Arc<Mutex<Vec<TestEvent>>>,
         ) -> Self {
             FakeCooldown { script, events }
@@ -336,18 +269,21 @@ pub mod fakes {
                 .push(TestEvent::GotCooldownStatus {
                     backend: target.to_string(),
                 });
-            let mut behaviors = self
+            let behavior = self
                 .script
                 .get(target)
-                .unwrap_or_else(|| {
-                    panic!("backend exists in script in specified order for {target}")
-                })
-                .lock()
-                .unwrap_or_else(|_| panic!("clean script lock for {target}"));
+                .unwrap_or_else(|| panic!("backend exists in script for {target}"));
 
-            behaviors
-                .pop_front()
-                .unwrap_or_else(|| panic!("cooldown behavior exists for {target}"))
+            match behavior {
+                CooldownSpec::Alive => Ok(BackendStatus::Alive { cool_until: None }),
+                CooldownSpec::Cooling { until } => Ok(BackendStatus::Alive {
+                    cool_until: Some(*until),
+                }),
+                CooldownSpec::Fail => Err(ProxyError::BackendNotFound {
+                    name: target.to_string(),
+                }),
+                CooldownSpec::Drain => Ok(BackendStatus::Drain),
+            }
         }
 
         fn report_connection_attempt(
@@ -366,28 +302,20 @@ pub mod fakes {
         }
 
         fn drain(&self, _target: &str) -> Result<(), ProxyError> {
-            panic!("unimplemented")
+            unimplemented!()
         }
     }
 
     impl Drop for FakeCooldown {
         fn drop(&mut self) {
             if thread::panicking() {
-                eprintln!("--- FakeCooldown script remaining dump ---");
-                for (k, vs) in self.script.iter() {
-                    eprintln!("* {k}");
-                    let vals = vs.try_lock();
-                    let l = if vals.is_err() { "<locked>" } else { "" };
-                    for (i, v) in vals.iter().enumerate() {
-                        eprintln!("   {i}: {v:?}{l}");
-                    }
+                eprintln!("--- FakeCooldown script dump ---");
+                for (target, script) in self.script.iter() {
+                    eprintln!("* {target}: {script:?}");
                 }
             }
         }
     }
-
-    type ResolverScript =
-        Arc<HashMap<String, Mutex<VecDeque<Result<Vec<SocketAddr>, ProxyError>>>>>;
 
     /// Fake resolver which resolves backends based on a script and records attempts in test events.
     #[derive(Clone, Debug)]
@@ -395,6 +323,21 @@ pub mod fakes {
         script: ResolverScript,
         events: Arc<Mutex<Vec<TestEvent>>>,
     }
+
+    #[derive(Clone, Debug)]
+    pub enum ResolveErrorSpec {
+        Nx,
+        Transient,
+        Fatal,
+    }
+
+    #[derive(Clone, Debug)]
+    pub enum ResolveSpec {
+        Success(Vec<SocketAddr>),
+        Error(ResolveErrorSpec),
+    }
+
+    type ResolverScript = Arc<HashMap<String, ResolveSpec>>;
 
     impl FakeResolver {
         pub fn new(script: ResolverScript, events: Arc<Mutex<Vec<TestEvent>>>) -> Self {
@@ -410,48 +353,40 @@ pub mod fakes {
                 .push(TestEvent::ResolveAttempted {
                     host: host.to_string(),
                 });
-            let mut behaviors = self
+            let behavior = self
                 .script
                 .get(host)
-                .unwrap_or_else(|| panic!("backend exists in script in specified order for {host}"))
-                .lock()
-                .unwrap_or_else(|_| panic!("clean script lock for {host}"));
+                .unwrap_or_else(|| panic!("backend exists in script for {host}"));
 
-            behaviors
-                .pop_front()
-                .unwrap_or_else(|| panic!("resolve behavior exists for {host}"))
-        }
-    }
-
-    impl Drop for FakeResolver {
-        fn drop(&mut self) {
-            if thread::panicking() {
-                eprintln!("--- FakeResolver script remaining dump ---");
-                for (k, vs) in self.script.iter() {
-                    eprintln!("* {k}");
-                    let vals = vs.try_lock();
-                    let l = if vals.is_err() { "<locked>" } else { "" };
-                    for (i, v) in vals.iter().enumerate() {
-                        eprintln!("   {i}: {v:?}{l}");
-                    }
+            match behavior {
+                ResolveSpec::Success(socks) => Ok(socks.clone()),
+                ResolveSpec::Error(ResolveErrorSpec::Nx) => Err(ProxyError::DnsNxError {
+                    message: format!("nx: {host}"),
+                }),
+                ResolveSpec::Error(ResolveErrorSpec::Transient) => {
+                    Err(ProxyError::DnsTransientError {
+                        message: format!("transient: {host}"),
+                    })
                 }
+                ResolveSpec::Error(ResolveErrorSpec::Fatal) => Err(ProxyError::ProxyStateError {
+                    message: format!("fatal resolve: {host}"),
+                }),
             }
         }
     }
-    type ConnectorScript =
-        Arc<HashMap<SocketAddr, Mutex<VecDeque<Result<DuplexStream, ProxyError>>>>>;
 
     /// Fake connector which connects backends based on a script and records attempts in test
     /// events.
     #[derive(Clone, Debug)]
     pub struct FakeConnector {
-        script: ConnectorScript,
         events: Arc<Mutex<Vec<TestEvent>>>,
     }
 
     impl FakeConnector {
-        pub fn new(script: ConnectorScript, events: Arc<Mutex<Vec<TestEvent>>>) -> Self {
-            FakeConnector { script, events }
+        const DUPLEX_BUF_SIZE: usize = 1024 * 8;
+
+        pub fn new(events: Arc<Mutex<Vec<TestEvent>>>) -> Self {
+            FakeConnector { events }
         }
     }
 
@@ -459,44 +394,26 @@ pub mod fakes {
         type Stream = DuplexStream;
 
         async fn connect(&self, addr: SocketAddr) -> Result<Self::Stream, ProxyError> {
-            if addr.port() == SOCK_FAIL {
-                return Err(ProxyError::IoError(Error::new(
-                    ErrorKind::AddrNotAvailable,
-                    format!("sock connect fail {SOCK_FAIL}: {addr}"),
-                )));
-            }
-            if addr.port() == SOCK_TIMEOUT {
-                return pending().await;
-            }
-            let mut behaviors = self
-                .script
-                .get(&addr)
-                .unwrap_or_else(|| panic!("backend exists for {addr} in script in specified order"))
-                .lock()
-                .unwrap_or_else(|_| panic!("clean script lock for {addr}"));
             self.events
                 .lock()
                 .unwrap_or_else(|_| panic!("clean events lock for {addr}"))
                 .push(TestEvent::ConnectAttempted { sock: addr });
-
-            behaviors
-                .pop_front()
-                .unwrap_or_else(|| panic!("connect behavior exists for {addr}"))
-        }
-    }
-
-    impl Drop for FakeConnector {
-        fn drop(&mut self) {
-            if thread::panicking() {
-                eprintln!("--- FakeConnector script remaining dump ---");
-                for (k, vs) in self.script.iter() {
-                    eprintln!("* {k}");
-                    let vals = vs.try_lock();
-                    let l = if vals.is_err() { "<locked>" } else { "" };
-                    for (i, v) in vals.iter().enumerate() {
-                        let f = format!("{:?}", v);
-                        eprintln!("   {i}: {f:.25}{l}");
-                    }
+            match addr.port() {
+                SOCK_GOOD => {
+                    let (_test_side, proxy_side) = duplex(Self::DUPLEX_BUF_SIZE);
+                    Ok(proxy_side)
+                }
+                SOCK_FAIL => Err(ProxyError::IoError(Error::new(
+                    ErrorKind::AddrNotAvailable,
+                    format!("sock connect fail {SOCK_FAIL}: {addr}"),
+                ))),
+                SOCK_CONNECT_ERR => Err(ProxyError::ConnectionError {
+                    port: addr.port(),
+                    message: "scripted connect error".to_string(),
+                }),
+                SOCK_TIMEOUT => pending().await,
+                other => {
+                    panic!("unknown scripted socket {other}")
                 }
             }
         }

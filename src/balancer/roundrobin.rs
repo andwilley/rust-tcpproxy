@@ -190,7 +190,7 @@ mod tests {
         balancer::roundrobinharness::{
             ConnectedBackendData, RoundRobinHarness,
             fakes::{
-                BackendBehavior,
+                BackendScript, ConnectSpec, CooldownSpec,
                 TestEvent::{GotCooldownStatus, ResolveAttempted},
             },
         },
@@ -205,41 +205,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn backends_connect_in_order() {
         let mut behaviors = HashMap::new();
-        behaviors.insert(
-            BACKEND_0.to_string(),
-            vec![BackendBehavior::ConnectSuccess {
-                cooldown: None,
-                bad_socket_cnt: 0,
-            }],
-        );
-        behaviors.insert(
-            BACKEND_1.to_string(),
-            vec![BackendBehavior::ConnectSuccess {
-                cooldown: None,
-                bad_socket_cnt: 0,
-            }],
-        );
-        behaviors.insert(
-            BACKEND_2.to_string(),
-            vec![BackendBehavior::ConnectSuccess {
-                cooldown: None,
-                bad_socket_cnt: 0,
-            }],
-        );
-        behaviors.insert(
-            BACKEND_3.to_string(),
-            vec![BackendBehavior::ConnectSuccess {
-                cooldown: None,
-                bad_socket_cnt: 0,
-            }],
-        );
-        behaviors.insert(
-            BACKEND_4.to_string(),
-            vec![BackendBehavior::ConnectSuccess {
-                cooldown: None,
-                bad_socket_cnt: 0,
-            }],
-        );
+        behaviors.insert(BACKEND_0.to_string(), BackendScript::default());
+        behaviors.insert(BACKEND_1.to_string(), BackendScript::default());
+        behaviors.insert(BACKEND_2.to_string(), BackendScript::default());
+        behaviors.insert(BACKEND_3.to_string(), BackendScript::default());
+        behaviors.insert(BACKEND_4.to_string(), BackendScript::default());
         let harness = RoundRobinHarness::new(
             default_config(vec![
                 BACKEND_0.to_string(),
@@ -272,11 +242,11 @@ mod tests {
             .await
             .expect("Should connect OK");
 
-        let expected_0 = ConnectedBackendData::with_defaults(0);
-        let expected_1 = ConnectedBackendData::with_defaults(1);
-        let expected_2 = ConnectedBackendData::with_defaults(2);
-        let expected_3 = ConnectedBackendData::with_defaults(3);
-        let expected_4 = ConnectedBackendData::with_defaults(4);
+        let expected_0 = ConnectedBackendData::new(0, 0);
+        let expected_1 = ConnectedBackendData::new(1, 0);
+        let expected_2 = ConnectedBackendData::new(2, 0);
+        let expected_3 = ConnectedBackendData::new(3, 0);
+        let expected_4 = ConnectedBackendData::new(4, 0);
         assert_eq!(connection_0, expected_0);
         assert_eq!(connection_1, expected_1);
         assert_eq!(connection_2, expected_2);
@@ -290,19 +260,19 @@ mod tests {
         let later = Instant::now() + Duration::from_mins(5);
         behaviors.insert(
             BACKEND_0.to_string(),
-            vec![BackendBehavior::CooldownSkip { cooldown: later }],
+            BackendScript {
+                cooldown: CooldownSpec::Cooling { until: later },
+                connect: ConnectSpec::NoConnection,
+            },
         );
         behaviors.insert(
             BACKEND_1.to_string(),
-            vec![BackendBehavior::CooldownSkip { cooldown: later }],
+            BackendScript {
+                cooldown: CooldownSpec::Cooling { until: later },
+                connect: ConnectSpec::NoConnection,
+            },
         );
-        behaviors.insert(
-            BACKEND_2.to_string(),
-            vec![BackendBehavior::ConnectSuccess {
-                cooldown: None,
-                bad_socket_cnt: 0,
-            }],
-        );
+        behaviors.insert(BACKEND_2.to_string(), BackendScript::default());
         let harness = RoundRobinHarness::new(
             default_config(vec![
                 BACKEND_0.to_string(),
@@ -319,10 +289,10 @@ mod tests {
             .expect("Should connect OK");
 
         // behavior 1 is the connect, after the skip for cooling
-        let expected = ConnectedBackendData::with_defaults(2);
+        let expected = ConnectedBackendData::new(2, 0);
         assert_eq!(connection, expected);
         // Attempt results in skipping first 2 backends
-        let expected_first_events = vec![
+        let expected_cooldowns = vec![
             GotCooldownStatus {
                 backend: BACKEND_0.to_string(),
             },
@@ -332,12 +302,14 @@ mod tests {
             GotCooldownStatus {
                 backend: BACKEND_2.to_string(),
             },
-            ResolveAttempted {
-                host: BACKEND_2.to_string(),
-            },
         ];
-        let actual_first_events = &harness.events()[..4];
-        assert_eq!(actual_first_events, expected_first_events);
+        let actual_cooldowns = harness.cooldown_events();
+        assert_eq!(actual_cooldowns, expected_cooldowns);
+        let actual_resolves = harness.resolve_events();
+        let expected_resolves = vec![ResolveAttempted {
+            host: BACKEND_2.to_string(),
+        }];
+        assert_eq!(actual_resolves, expected_resolves);
     }
 
     #[tokio::test(start_paused = true)]
@@ -346,23 +318,17 @@ mod tests {
         let later = Instant::now() + Duration::from_mins(5);
         behaviors.insert(
             BACKEND_0.to_string(),
-            vec![
-                BackendBehavior::CooldownSkip { cooldown: later },
-                BackendBehavior::ConnectSuccess {
-                    cooldown: Some(later),
-                    bad_socket_cnt: 0,
-                },
-            ],
+            BackendScript {
+                cooldown: CooldownSpec::Cooling { until: later },
+                connect: ConnectSpec::Success { bad_socket_cnt: 0 },
+            },
         );
         behaviors.insert(
             BACKEND_1.to_string(),
-            vec![
-                BackendBehavior::CooldownSkip { cooldown: later },
-                BackendBehavior::ConnectSuccess {
-                    cooldown: Some(later),
-                    bad_socket_cnt: 0,
-                },
-            ],
+            BackendScript {
+                cooldown: CooldownSpec::Cooling { until: later },
+                connect: ConnectSpec::Success { bad_socket_cnt: 0 },
+            },
         );
         let harness = RoundRobinHarness::new(
             default_config(vec![BACKEND_0.to_string(), BACKEND_1.to_string()]),
@@ -380,16 +346,8 @@ mod tests {
             .expect("Should connect OK");
 
         // behavior 1 for each is the connect, after the skip for cooling
-        let expected_0 = ConnectedBackendData {
-            target_id: 0,
-            behavior_num: 1,
-            instance: 0,
-        };
-        let expected_1 = ConnectedBackendData {
-            target_id: 1,
-            behavior_num: 1,
-            instance: 0,
-        };
+        let expected_0 = ConnectedBackendData::new(0, 0);
+        let expected_1 = ConnectedBackendData::new(1, 0);
         assert_eq!(connection_0, expected_0);
         assert_eq!(connection_1, expected_1);
         // Each attempt results in skipping each backend then retying in RR order.
@@ -401,6 +359,8 @@ mod tests {
                 backend: BACKEND_1.to_string(),
             },
         ];
+        let actual_cooldowns = harness.cooldown_events();
+        assert_eq!(actual_cooldowns[..2], expected_first_connection_cooldowns);
         let expected_second_connection_cooldowns = vec![
             GotCooldownStatus {
                 backend: BACKEND_1.to_string(),
@@ -409,18 +369,8 @@ mod tests {
                 backend: BACKEND_0.to_string(),
             },
         ];
-        let events = harness.events();
-        let actual_first_connection_cooldowns = &events[..2];
-        assert_eq!(
-            actual_first_connection_cooldowns,
-            expected_first_connection_cooldowns
-        );
         // after first connection's resolve, connect, report events
-        let actual_second_connection_cooldowns = &events[5..7];
-        assert_eq!(
-            actual_second_connection_cooldowns,
-            expected_second_connection_cooldowns
-        );
+        assert_eq!(actual_cooldowns[2..], expected_second_connection_cooldowns);
     }
 
     const PORT: u16 = 8080;
