@@ -184,15 +184,14 @@ where
     }
 }
 
-/// TODO: The unused token warnings are essentially the remaining test coverage TODOs.
 #[cfg(test)]
 mod tests {
     use crate::{
         balancer::roundrobinharness::{
             ConnectedBackendData, RoundRobinHarness,
             fakes::{
-                BackendScript, ConnectSpec, CooldownSpec,
-                TestEvent::{GotCooldownStatus, ResolveAttempted},
+                self, BackendScript, ConnectSpec, CooldownSpec,
+                TestEvent::{ConnectAttempted, GotCooldownStatus, ResolveAttempted},
             },
         },
         config::{App, RawConfig},
@@ -402,7 +401,7 @@ mod tests {
         // Third connection
         let expected_2 = ConnectedBackendData::new(2, 0);
         assert_eq!(connection_2, expected_2);
-        let expected_second_connection_cooldowns = vec![
+        let expected_third_connection_cooldowns = vec![
             GotCooldownStatus {
                 backend: BACKEND_2.to_string(),
             },
@@ -413,12 +412,13 @@ mod tests {
                 backend: BACKEND_1.to_string(),
             },
         ];
-        assert_eq!(actual_cooldowns[6..], expected_second_connection_cooldowns);
+        assert_eq!(actual_cooldowns[6..], expected_third_connection_cooldowns);
     }
 
     #[tokio::test(start_paused = true)]
     async fn no_targets_fails() {
-        let harness = RoundRobinHarness::new(default_config(Vec::new()), HashMap::new());
+        let harness =
+            RoundRobinHarness::new(default_config(vec![BACKEND_0.to_string()]), HashMap::new());
         const BAD_PORT: u16 = 9876;
         match harness.connect_backend(BAD_PORT).await {
             Err(ProxyError::TargetResolutionError { port, message }) => {
@@ -498,8 +498,218 @@ mod tests {
                     format!("Unable to connect to any backend for port {PORT}")
                 );
             }
-            other => panic!("expected target resolution error but got: {other:?}"),
+            other => panic!("expected unable to connect but got: {other:?}"),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cooldown_check_fail() {
+        let mut behaviors = HashMap::new();
+        behaviors.insert(
+            BACKEND_0.to_string(),
+            BackendScript {
+                cooldown: CooldownSpec::Fail,
+                connect: ConnectSpec::NoConnection,
+            },
+        );
+        let harness =
+            RoundRobinHarness::new(default_config(vec![BACKEND_0.to_string()]), behaviors);
+
+        match harness.connect_backend(PORT).await {
+            Err(ProxyError::BackendNotFound { name }) => {
+                assert_eq!(name, BACKEND_0);
+            }
+            other => panic!("expected cooldown check to fail but got: {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn skips_transient_dns_errors_connects() {
+        let mut behaviors = HashMap::new();
+        behaviors.insert(
+            BACKEND_0.to_string(),
+            BackendScript {
+                cooldown: CooldownSpec::Alive,
+                connect: ConnectSpec::ResolveError(fakes::ResolveErrorSpec::Transient),
+            },
+        );
+        behaviors.insert(
+            BACKEND_1.to_string(),
+            BackendScript {
+                cooldown: CooldownSpec::Alive,
+                connect: ConnectSpec::ResolveError(fakes::ResolveErrorSpec::Nx),
+            },
+        );
+        behaviors.insert(BACKEND_2.to_string(), BackendScript::default());
+        let harness = RoundRobinHarness::new(
+            default_config(vec![
+                BACKEND_0.to_string(),
+                BACKEND_1.to_string(),
+                BACKEND_2.to_string(),
+            ]),
+            behaviors,
+        );
+
+        // skips resolve fail backends and connects to backend 2
+        let connection = harness
+            .connect_backend(PORT)
+            .await
+            .expect("Should connect OK");
+
+        let expected = ConnectedBackendData::new(2, 0);
+        assert_eq!(connection, expected);
+        // Attempt results in skipping first 2 backends
+        let expected_status_checks = vec![
+            GotCooldownStatus {
+                backend: BACKEND_0.to_string(),
+            },
+            GotCooldownStatus {
+                backend: BACKEND_1.to_string(),
+            },
+            GotCooldownStatus {
+                backend: BACKEND_2.to_string(),
+            },
+        ];
+        let actual_cooldowns = harness.get_status_events();
+        assert_eq!(actual_cooldowns, expected_status_checks);
+        // Should attempt resolution on all backends.
+        let actual_resolves = harness.resolve_events();
+        let expected_resolves = vec![
+            ResolveAttempted {
+                host: BACKEND_0.to_string(),
+            },
+            ResolveAttempted {
+                host: BACKEND_1.to_string(),
+            },
+            ResolveAttempted {
+                host: BACKEND_2.to_string(),
+            },
+        ];
+        assert_eq!(actual_resolves, expected_resolves);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fatal_resolution_error_fails() {
+        let mut behaviors = HashMap::new();
+        behaviors.insert(
+            BACKEND_0.to_string(),
+            BackendScript {
+                cooldown: CooldownSpec::Alive,
+                connect: ConnectSpec::ResolveError(fakes::ResolveErrorSpec::Fatal),
+            },
+        );
+        let harness =
+            RoundRobinHarness::new(default_config(vec![BACKEND_0.to_string()]), behaviors);
+
+        match harness.connect_backend(PORT).await {
+            Err(ProxyError::ProxyStateError { message }) => {
+                assert_eq!(message, format!("fatal resolve: {BACKEND_0}"));
+            }
+            other => panic!("expected resolve to fail fatally but got: {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_fails_second_has_fail_sockets_connects() {
+        let mut behaviors = HashMap::new();
+        behaviors.insert(
+            BACKEND_0.to_string(),
+            BackendScript {
+                cooldown: CooldownSpec::Alive,
+                connect: ConnectSpec::Fail,
+            },
+        );
+        behaviors.insert(
+            BACKEND_1.to_string(),
+            BackendScript {
+                cooldown: CooldownSpec::Alive,
+                connect: ConnectSpec::Success { bad_socket_cnt: 2 },
+            },
+        );
+        let harness = RoundRobinHarness::new(
+            default_config(vec![BACKEND_0.to_string(), BACKEND_1.to_string()]),
+            behaviors,
+        );
+
+        let connection = harness.connect_backend(PORT).await.expect("connection OK");
+
+        let expected = ConnectedBackendData::new(1, 2);
+        assert_eq!(connection, expected);
+        // Tries connections for backend 0 and for all 3 sockets on backend 1
+        let actual_connect_events = harness.connect_events();
+        let expected_connect_events = vec![
+            ConnectAttempted(ConnectedBackendData::new(0, 0)),
+            ConnectAttempted(ConnectedBackendData::new(1, 0)),
+            ConnectAttempted(ConnectedBackendData::new(1, 1)),
+            ConnectAttempted(ConnectedBackendData::new(1, 2)),
+        ];
+        assert_eq!(actual_connect_events, expected_connect_events);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_all_socks_fail_second_connects() {
+        let mut behaviors = HashMap::new();
+        behaviors.insert(
+            BACKEND_0.to_string(),
+            BackendScript {
+                cooldown: CooldownSpec::Alive,
+                connect: ConnectSpec::SockFail { bad_socket_cnt: 2 },
+            },
+        );
+        behaviors.insert(
+            BACKEND_1.to_string(),
+            BackendScript {
+                cooldown: CooldownSpec::Alive,
+                connect: ConnectSpec::Success { bad_socket_cnt: 0 },
+            },
+        );
+        let harness = RoundRobinHarness::new(
+            default_config(vec![BACKEND_0.to_string(), BACKEND_1.to_string()]),
+            behaviors,
+        );
+
+        let connection = harness.connect_backend(PORT).await.expect("connection OK");
+
+        let expected = ConnectedBackendData::new(1, 0);
+        assert_eq!(connection, expected);
+        // Tries connections on 2 socks for backend 0 and succeeds on backend 1
+        let actual_connect_events = harness.connect_events();
+        let expected_connect_events = vec![
+            ConnectAttempted(ConnectedBackendData::new(0, 0)),
+            ConnectAttempted(ConnectedBackendData::new(0, 1)),
+            ConnectAttempted(ConnectedBackendData::new(1, 0)),
+        ];
+        assert_eq!(actual_connect_events, expected_connect_events);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_timeout_tries_next_backend() {
+        let mut behaviors = HashMap::new();
+        behaviors.insert(
+            BACKEND_0.to_string(),
+            BackendScript {
+                cooldown: CooldownSpec::Alive,
+                connect: ConnectSpec::Timeout,
+            },
+        );
+        behaviors.insert(BACKEND_1.to_string(), BackendScript::default());
+        let harness = RoundRobinHarness::new(
+            default_config(vec![BACKEND_0.to_string(), BACKEND_1.to_string()]),
+            behaviors,
+        );
+
+        let start = tokio::time::Instant::now();
+        let connection = harness.connect_backend(PORT).await.expect("connection OK");
+        let elapsed = start.elapsed();
+
+        assert_eq!(connection, ConnectedBackendData::new(1, 0));
+        // Connection timeout elapsed
+        assert_eq!(elapsed, Duration::from_secs(5));
+        let expected_connect_events = vec![
+            ConnectAttempted(ConnectedBackendData::new(0, 0)),
+            ConnectAttempted(ConnectedBackendData::new(1, 0)),
+        ];
+        assert_eq!(harness.connect_events(), expected_connect_events);
     }
 
     const PORT: u16 = 8080;

@@ -13,8 +13,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-/// A test harness for unit testing the RoundRobinBalancer. Currently supports a single cripted
-/// behvaior (cooldown and connect) per harness instance. Describe your scripted behavior for each
+/// A test harness for unit testing the RoundRobinBalancer. Currently supports a single scripted
+/// behavior (cooldown and connect) per harness instance. Describe your scripted behavior for each
 /// backend and construct the harness, then invoke connect_backend and assert on the data returned
 /// or the events log, which records work done by the fakes in the test.
 /// TODO:
@@ -114,6 +114,10 @@ impl RoundRobinHarness {
         self.events_where(|e| matches!(e, fakes::TestEvent::ResolveAttempted { .. }))
     }
 
+    pub fn connect_events(&self) -> Vec<fakes::TestEvent> {
+        self.events_where(|e| matches!(e, fakes::TestEvent::ConnectAttempted { .. }))
+    }
+
     pub fn events_where(
         &self,
         mut filter: impl FnMut(&fakes::TestEvent) -> bool,
@@ -129,7 +133,7 @@ impl RoundRobinHarness {
 }
 
 /// Test-relevant data about a particular connected backend.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct ConnectedBackendData {
     pub target_id: usize,
     pub instance: usize,
@@ -149,7 +153,7 @@ impl From<SocketAddr> for ConnectedBackendData {
         let SocketAddr::V4(addr) = source else {
             panic!("expected ipv4 address for test backend");
         };
-        let [id, _, instance, _] = addr.ip().octets();
+        let [id, instance, _, _] = addr.ip().octets();
         ConnectedBackendData {
             target_id: id.into(),
             instance: instance.into(),
@@ -169,13 +173,16 @@ impl From<SocketAddr> for ConnectedBackendData {
 ///                 |  |        unused
 ///                 |  an extra differentiator for uniqueness
 ///                 the ID provided via port number for this target
-fn test_sock(id: u8, instance: u8, port: u16) -> SocketAddr {
+pub fn test_sock(id: u8, instance: u8, port: u16) -> SocketAddr {
     SocketAddr::from((Ipv4Addr::new(id, instance, 0, 0), port))
 }
 
 pub mod fakes {
     use crate::{
-        balancer::traits::{ConnectResult, CooldownHandler},
+        balancer::{
+            roundrobinharness::ConnectedBackendData,
+            traits::{ConnectResult, CooldownHandler},
+        },
         errors::ProxyError,
         network::traits::{Resolver, StreamConnector},
         state::BackendStatus,
@@ -186,7 +193,6 @@ pub mod fakes {
         io::{Error, ErrorKind},
         net::SocketAddr,
         sync::{Arc, Mutex},
-        thread,
         time::Instant,
     };
     use tokio::io::{DuplexStream, duplex};
@@ -237,9 +243,7 @@ pub mod fakes {
         ResolveAttempted {
             host: String,
         },
-        ConnectAttempted {
-            sock: SocketAddr,
-        },
+        ConnectAttempted(ConnectedBackendData),
         CooldownReported {
             backend: String,
             result: ConnectResult,
@@ -314,17 +318,6 @@ pub mod fakes {
 
         fn drain(&self, _target: &str) -> Result<(), ProxyError> {
             unimplemented!()
-        }
-    }
-
-    impl Drop for FakeCooldown {
-        fn drop(&mut self) {
-            if thread::panicking() {
-                eprintln!("--- FakeCooldown script dump ---");
-                for (target, script) in self.script.iter() {
-                    eprintln!("* {target}: {script:?}");
-                }
-            }
         }
     }
 
@@ -408,7 +401,7 @@ pub mod fakes {
             self.events
                 .lock()
                 .unwrap_or_else(|_| panic!("clean events lock for {addr}"))
-                .push(TestEvent::ConnectAttempted { sock: addr });
+                .push(TestEvent::ConnectAttempted(addr.into()));
             match addr.port() {
                 SOCK_GOOD => {
                     let (_test_side, proxy_side) = duplex(Self::DUPLEX_BUF_SIZE);
