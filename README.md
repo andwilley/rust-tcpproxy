@@ -42,10 +42,9 @@ resolution at TTLs could be first step.
 
 We limit number of connections and queue size via flags strictly as a way to
 control total memory usage. This could be made more fair by enforcing per port
-quotas, but that seems fraught with assumptions about which traffic is critical
-for the client. We could also strictly bound the queue wait time to avoid long
-delays by waiting in the queue, but for now this can be tuned via the relative
-sizes of max connections.
+quotas; a config entry for quota, criticality, or something similar. We could
+also strictly bound the queue wait time to avoid long delays by waiting in the
+queue, but for now this can be tuned via the relative sizes of max connections.
 
 As is this means that we actively pull new connections off the network queue
 and drop them. This was deliberately chosen over letting them sit. A prompt
